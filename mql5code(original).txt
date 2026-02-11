@@ -103,6 +103,7 @@ input double   INPUT_MIN_LOT_SIZE          = 0.01;// Minimum lot size
 input double   INPUT_MAX_TOTAL_RISK_PERCENT = 5.0;// Max total portfolio risk %
 //--- Money Management / Streak Multiplier
 input group    "=== Money Management / Streak Multiplier ==="
+input bool     INPUT_ENABLE_DYNAMIC_LOT_SCALING = true; // Apply dynamic lot scaling (threat/confidence/RL/adaptive)
 input bool     INPUT_ENABLE_STREAK_LOT_MULTIPLIER = true;
 input int      INPUT_STREAK_TRIGGER_WINS = 2;
 input double   INPUT_STREAK_LOT_MULTIPLIER = 1.5;
@@ -572,6 +573,10 @@ int OnInit()
          Print("ERROR: INPUT_STREAK_LOT_MULTIPLIER must be > 1.0 when enabled");
          return INIT_PARAMETERS_INCORRECT;
       }
+   }
+   else
+   {
+      g_streakMultiplierOrdersRemaining = 0;
    }
    if(INPUT_ENABLE_HIGH_SPREAD_PROTECT && INPUT_HIGH_SPREAD_MULTIPLIER <= 1.0)
    {
@@ -3029,24 +3034,64 @@ double CalculateLotSize(double slPoints, double confidence, double threat, ENUM_
    lotSize *= confFactor;
    
    // RL scaling
-   if(INPUT_ENABLE_RL)
+      double baseLot = lotSize;
+
+   // Default multipliers (all neutral unless enabled below)
+   double threatFactor = 1.0;
+   double confFactor = 1.0;
+   double rlFactor = 1.0;
+   double adaptiveFactor = 1.0;
+   double streakFactor = 1.0;
+
+   if(INPUT_ENABLE_DYNAMIC_LOT_SCALING)
    {
-      switch(rlAction)
+      // Threat factor (never below 25%)
+      threatFactor = 1.0 - (threat / 200.0);
+      threatFactor = MathMax(threatFactor, 0.25);
+
+      // Confidence factor - less aggressive (0.5-1.0)
+      confFactor = 0.5 + (confidence / 200.0);
+
+      // RL scaling
+      if(INPUT_ENABLE_RL)
       {
-         case RL_HALF_SIZE:    lotSize *= 0.5; break;
-         case RL_QUARTER_SIZE: lotSize *= 0.25; break;
-         case RL_SKIP_TRADE:   return 0; // Should never reach here
-         default: break;
+         switch(rlAction)
+         {
+            case RL_HALF_SIZE:    rlFactor = 0.5; break;
+            case RL_QUARTER_SIZE: rlFactor = 0.25; break;
+            case RL_SKIP_TRADE:   return 0; // Should never reach here
+            default: break;
+         }
       }
+
+      // Adaptive multiplier
+      adaptiveFactor = g_adaptive.lotMultiplier;
    }
-   
-    // Adaptive multiplier
-   lotSize *= g_adaptive.lotMultiplier;
 
    if(INPUT_ENABLE_STREAK_LOT_MULTIPLIER &&
       g_streakMultiplierOrdersRemaining > 0 &&
       INPUT_STREAK_LOT_MULTIPLIER > 1.0)
-      lotSize *= INPUT_STREAK_LOT_MULTIPLIER;
+     {
+      streakFactor = INPUT_STREAK_LOT_MULTIPLIER;
+   }
+
+   lotSize *= threatFactor;
+   lotSize *= confFactor;
+   lotSize *= rlFactor;
+   lotSize *= adaptiveFactor;
+   lotSize *= streakFactor;
+
+   if(INPUT_ENABLE_LOGGING)
+   {
+      Print("LOT BREAKDOWN | Base=", DoubleToString(baseLot, 4),
+            " | Dynamic=", (INPUT_ENABLE_DYNAMIC_LOT_SCALING ? "ON" : "OFF"),
+            " | ThreatF=", DoubleToString(threatFactor, 3),
+            " | ConfF=", DoubleToString(confFactor, 3),
+            " | RLF=", DoubleToString(rlFactor, 3),
+            " | AdaptF=", DoubleToString(adaptiveFactor, 3),
+            " | StreakF=", DoubleToString(streakFactor, 3),
+            " | PreRoundLot=", DoubleToString(lotSize, 4));
+   }
 
    // Round to lot step and clamp to limits
    lotSize = MathFloor(lotSize / lotStep) * lotStep;
@@ -3857,15 +3902,21 @@ void ProcessClosedPositions()
          g_daily.winsToday++;
          g_daily.profitToday += netProfit;
 
-         if(INPUT_ENABLE_STREAK_LOT_MULTIPLIER &&
-            g_consecutiveWins >= INPUT_STREAK_TRIGGER_WINS &&
-            dealTicket != g_lastStreakActivatedDeal)
+         if(INPUT_ENABLE_STREAK_LOT_MULTIPLIER)
          {
-            g_streakMultiplierOrdersRemaining = INPUT_STREAK_MULTIPLIER_ORDERS;
-            g_lastStreakActivatedDeal = dealTicket;
-            Print("STREAK LOT MULTIPLIER ACTIVATED: wins=", g_consecutiveWins,
-                  " | multiplier=", DoubleToString(INPUT_STREAK_LOT_MULTIPLIER, 2),
-                  " | boosted orders=", g_streakMultiplierOrdersRemaining);
+            if(g_consecutiveWins >= INPUT_STREAK_TRIGGER_WINS &&
+               dealTicket != g_lastStreakActivatedDeal)
+            {
+               g_streakMultiplierOrdersRemaining = INPUT_STREAK_MULTIPLIER_ORDERS;
+               g_lastStreakActivatedDeal = dealTicket;
+               Print("STREAK LOT MULTIPLIER ACTIVATED: wins=", g_consecutiveWins,
+                     " | multiplier=", DoubleToString(INPUT_STREAK_LOT_MULTIPLIER, 2),
+                     " | boosted orders=", g_streakMultiplierOrdersRemaining);
+            }
+         }
+         else
+         {
+            g_streakMultiplierOrdersRemaining = 0;
          }
       }
       else
@@ -3875,8 +3926,7 @@ void ProcessClosedPositions()
          g_daily.lossesToday++;
          g_daily.lossToday += MathAbs(netProfit);
 
-         if(INPUT_ENABLE_STREAK_LOT_MULTIPLIER)
-            g_streakMultiplierOrdersRemaining = 0;
+                 g_streakMultiplierOrdersRemaining = 0;
       }
       
       // Markov update (if enabled)
