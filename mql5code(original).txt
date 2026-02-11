@@ -2628,21 +2628,17 @@ bool IsSpreadHigh()
    if(INPUT_HIGH_SPREAD_MULTIPLIER <= 1.0)
       return false;
 
-   double spreadPoints = (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-   double spread = spreadPoints * g_point;
+   double spread = SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(spread <= 0.0)
+      spread = (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) * g_point;
 
    if(spread <= 0.0)
       return false;
 
-   if(g_spreadSamples < MIN_SPREAD_SAMPLES)
+   if(g_spreadSamples < MIN_SPREAD_SAMPLES || g_averageSpread <= 0.0)
       return false;
 
-   double avgSpread = (g_averageSpread > 0) ? g_averageSpread : spread;
-
-   if(avgSpread <= 0)
-      return false;
-
-   return (spread > avgSpread * INPUT_HIGH_SPREAD_MULTIPLIER);
+   return (spread > g_averageSpread * INPUT_HIGH_SPREAD_MULTIPLIER);
 }
 //+------------------------------------------------------------------+
 bool ShouldPrintOncePerWindow(string key, int secondsWindow)
@@ -2673,12 +2669,17 @@ bool ShouldPrintOncePerWindow(string key, int secondsWindow)
 //+------------------------------------------------------------------+
 void HandleHighSpreadOpenPositions()
 {
+   if(!INPUT_CLOSE_PROFIT_ON_HIGH_SPREAD && !INPUT_KEEP_LOSS_STOPS_ON_HIGH_SPREAD)
+      return;
+
+   // Keep spread stats current for tick-level protection logic
+   UpdateAverageSpread();
+
    if(!IsSpreadHigh())
       return;
- double closePercent = MathMax(0.0, MathMin(100.0, INPUT_HIGH_SPREAD_CLOSE_PERCENT));
+
+   double closePercent = MathMax(0.0, MathMin(100.0, INPUT_HIGH_SPREAD_CLOSE_PERCENT));
    double closeRatio = closePercent / 100.0;
-   if(closeRatio <= 0.0)
-      return;
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -2686,7 +2687,7 @@ void HandleHighSpreadOpenPositions()
       if(ticket == 0 || !IsOurPosition(ticket))
          continue;
 
-       int trackedIdx = -1;
+      int trackedIdx = -1;
       for(int j = 0; j < g_positionCount; j++)
       {
          if(g_positions[j].isActive && g_positions[j].ticket == ticket)
@@ -2702,11 +2703,14 @@ void HandleHighSpreadOpenPositions()
       double netProfit = PositionGetDouble(POSITION_PROFIT);
       double currentLots = PositionGetDouble(POSITION_VOLUME);
 
-      if(netProfit > 0.0 && INPUT_CLOSE_PROFIT_ON_HIGH_SPREAD)
+      if(netProfit > 0.0 && INPUT_CLOSE_PROFIT_ON_HIGH_SPREAD && closeRatio > 0.0)
       {
          double lotsToClose = currentLots * closeRatio;
          lotsToClose = MathFloor(lotsToClose / g_lotStep) * g_lotStep;
-         lotsToClose = MathMax(lotsToClose, g_minLot);
+
+         // If ratio is too small after volume-step rounding, skip instead of invalid partial close.
+         if(lotsToClose > 0.0 && lotsToClose < g_minLot)
+            lotsToClose = 0.0;
 
          if(lotsToClose >= currentLots)
          {
@@ -2715,7 +2719,7 @@ void HandleHighSpreadOpenPositions()
                if(trackedIdx >= 0)
                {
                   g_positions[trackedIdx].highSpreadClosed = true;
-                  g_positions[trackedIdx].currentLots = 0;
+                  g_positions[trackedIdx].currentLots = 0.0;
                }
                Print("HIGH SPREAD: fully closed profitable position ", ticket,
                      " | close%=", DoubleToString(closePercent, 1));
@@ -2728,7 +2732,7 @@ void HandleHighSpreadOpenPositions()
                if(trackedIdx >= 0)
                {
                   g_positions[trackedIdx].highSpreadClosed = true;
-                  g_positions[trackedIdx].currentLots = currentLots - lotsToClose;
+                  g_positions[trackedIdx].currentLots = MathMax(0.0, currentLots - lotsToClose);
                }
                Print("HIGH SPREAD: partial close on profitable position ", ticket,
                      " | ClosedLots=", DoubleToString(lotsToClose, 2),
@@ -2996,47 +3000,40 @@ int GetCurrentSession()
 //+------------------------------------------------------------------+
 double CalculateLotSize(double slPoints, double confidence, double threat, ENUM_RL_ACTION rlAction)
 {
-   if(slPoints <= 0) return 0;
+   if(slPoints <= 0.0)
+      return 0.0;
 
    double lotStep = g_lotStep;
    if(!MathIsValidNumber(lotStep) || lotStep <= 0.0)
       lotStep = 0.01;
-   
+
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    double riskMoney = balance * (g_risk.riskPercent / 100.0);
-   
-   // Base lot size from risk (using OrderCalcProfit)
+   if(riskMoney <= 0.0)
+      return 0.0;
+
    double slValue = slPoints * g_point;
-   double lotSize = 0;
-   
-   double testProfit = 0;
    double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   if(OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, 1.0, price, price + slValue, testProfit))
+   double lotSize = 0.0;
+
+   // Preferred risk sizing via OrderCalcProfit (instrument-aware)
+   double testProfit = 0.0;
+   if(OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, 1.0, price, price - slValue, testProfit))
    {
-      if(MathAbs(testProfit) > 0)
+      if(MathAbs(testProfit) > 0.0)
          lotSize = riskMoney / MathAbs(testProfit);
    }
-   
-   // Fallback using tick value/size
-   if(!MathIsValidNumber(lotSize) || lotSize <= 0)
-      lotSize = riskMoney / (slPoints * (g_tickValue / g_tickSize) * g_point);
-   
-   if(!MathIsValidNumber(lotSize) || lotSize <= 0)
-      return 0;
-   
-   // Threat factor (never below 25?%)
-   double threatFactor = 1.0 - (threat / 200.0);
-   threatFactor = MathMax(threatFactor, 0.25);
-   lotSize *= threatFactor;
-   
-   // Confidence factor â€“ less aggressive now (0.5?1.0 instead of 0?1)
-   double confFactor = 0.5 + (confidence / 200.0);
-   lotSize *= confFactor;
-   
-   // RL scaling
-      double baseLot = lotSize;
 
-   // Default multipliers (all neutral unless enabled below)
+   // Fallback risk sizing via tick value/size
+   if((!MathIsValidNumber(lotSize) || lotSize <= 0.0) && g_tickSize > 0.0)
+      lotSize = riskMoney / (slPoints * (g_tickValue / g_tickSize) * g_point);
+
+   if(!MathIsValidNumber(lotSize) || lotSize <= 0.0)
+      return 0.0;
+
+   double baseLot = lotSize;
+
+   // Multipliers (neutral by default)
    double threatFactor = 1.0;
    double confFactor = 1.0;
    double rlFactor = 1.0;
@@ -3045,33 +3042,31 @@ double CalculateLotSize(double slPoints, double confidence, double threat, ENUM_
 
    if(INPUT_ENABLE_DYNAMIC_LOT_SCALING)
    {
-      // Threat factor (never below 25%)
       threatFactor = 1.0 - (threat / 200.0);
       threatFactor = MathMax(threatFactor, 0.25);
 
-      // Confidence factor - less aggressive (0.5-1.0)
       confFactor = 0.5 + (confidence / 200.0);
 
-      // RL scaling
       if(INPUT_ENABLE_RL)
       {
          switch(rlAction)
          {
-            case RL_HALF_SIZE:    rlFactor = 0.5; break;
+            case RL_HALF_SIZE:    rlFactor = 0.5;  break;
             case RL_QUARTER_SIZE: rlFactor = 0.25; break;
-            case RL_SKIP_TRADE:   return 0; // Should never reach here
+            case RL_SKIP_TRADE:   return 0.0;
             default: break;
          }
       }
 
-      // Adaptive multiplier
       adaptiveFactor = g_adaptive.lotMultiplier;
+      if(!MathIsValidNumber(adaptiveFactor) || adaptiveFactor <= 0.0)
+         adaptiveFactor = 1.0;
    }
 
    if(INPUT_ENABLE_STREAK_LOT_MULTIPLIER &&
       g_streakMultiplierOrdersRemaining > 0 &&
       INPUT_STREAK_LOT_MULTIPLIER > 1.0)
-     {
+   {
       streakFactor = INPUT_STREAK_LOT_MULTIPLIER;
    }
 
@@ -3093,26 +3088,30 @@ double CalculateLotSize(double slPoints, double confidence, double threat, ENUM_
             " | PreRoundLot=", DoubleToString(lotSize, 4));
    }
 
-   // Round to lot step and clamp to limits
+   // Round and clamp
    lotSize = MathFloor(lotSize / lotStep) * lotStep;
    lotSize = MathMax(lotSize, g_risk.minLot);
    lotSize = MathMin(lotSize, g_risk.maxLot);
    lotSize = MathMax(lotSize, g_minLot);
    lotSize = MathMin(lotSize, g_maxLot);
-   
-   // Check margin
-   double marginRequired = 0;
+
+   if(!MathIsValidNumber(lotSize) || lotSize < g_minLot)
+      return 0.0;
+
+   // Margin check and downsize if needed
+   double marginRequired = 0.0;
    if(!OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, lotSize, price, marginRequired))
-      return 0;
-   
+      return 0.0;
+
    double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
-   if(marginRequired > freeMargin * 0.8)
+   if(marginRequired > freeMargin * 0.8 && lotSize > 0.0)
    {
       lotSize = (freeMargin * 0.5) / (marginRequired / lotSize);
-            lotSize = MathFloor(lotSize / lotStep) * lotStep;
-      if(lotSize < g_minLot) return 0;
+      lotSize = MathFloor(lotSize / lotStep) * lotStep;
+      if(lotSize < g_minLot)
+         return 0.0;
    }
-   
+
    return lotSize;
 }
 //+------------------------------------------------------------------+
@@ -4964,4 +4963,3 @@ void HandleMultiLevelPartial(ulong ticket)
       g_trade.PositionClosePartial(ticket, NormalizeDouble(vol * 0.25, 2)); 
    }
 }
-
