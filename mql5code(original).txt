@@ -79,7 +79,7 @@ enum ENUM_MARKOV_STATE
 //| SECTION 2: INPUT PARAMETERS                                      |
 //+------------------------------------------------------------------+
 //--- Expiry Lock
- group    "=== Expiry Lock ==="
+
  int      INPUT_EXPIRY_YEAR  = 2030;         // Expiry Year (FIXED: Extended)
  int      INPUT_EXPIRY_MONTH = 12;           // Expiry Month
  int      INPUT_EXPIRY_DAY   = 31;           // Expiry Day
@@ -101,6 +101,18 @@ input double   INPUT_RISK_PERCENT          = 1.0; // Risk % per trade (0=use pro
 input double   INPUT_MAX_LOT_SIZE          = 5.0; // Maximum lot size
 input double   INPUT_MIN_LOT_SIZE          = 0.01;// Minimum lot size
 input double   INPUT_MAX_TOTAL_RISK_PERCENT = 5.0;// Max total portfolio risk %
+//--- Money Management / Streak Multiplier
+input group    "=== Money Management / Streak Multiplier ==="
+input bool     INPUT_ENABLE_STREAK_LOT_MULTIPLIER = true;
+input int      INPUT_STREAK_TRIGGER_WINS = 2;
+input double   INPUT_STREAK_LOT_MULTIPLIER = 1.5;
+input int      INPUT_STREAK_MULTIPLIER_ORDERS = 3;
+//--- High Spread Protection
+input group    "=== High Spread Protection ==="
+input bool     INPUT_ENABLE_HIGH_SPREAD_PROTECT = true;
+input double   INPUT_HIGH_SPREAD_MULTIPLIER = 5.0;
+input bool     INPUT_CLOSE_PROFIT_ON_HIGH_SPREAD = true;
+input bool     INPUT_KEEP_LOSS_STOPS_ON_HIGH_SPREAD = true;
 //--- Equity Protection
 input group    "=== Equity Protection ==="
 input double   INPUT_EQUITY_FLOOR_PERCENT    = 85.0; // Equity floor % (close all below)
@@ -447,6 +459,7 @@ RiskParams g_risk;
 AdaptiveParams g_adaptive;
 //--- Trading state
 ENUM_EA_STATE g_eaState = STATE_IDLE;
+ENUM_EA_STATE g_prevEaState = STATE_IDLE;
 PositionState g_positions[];
 int      g_positionCount = 0;
 int      g_mainPositionCount = 0;
@@ -511,6 +524,10 @@ AIResponse g_aiResponse;
 datetime g_lastAIQuery = 0;
 //--- History tracking
 ulong    g_lastProcessedDealTicket = 0;
+datetime g_lastExtremeResolvedLogTime = 0;
+bool     g_extremeResolvedLogged = false;
+int      g_streakMultiplierOrdersRemaining = 0;
+ulong    g_lastStreakActivatedDeal = 0;
 //+------------------------------------------------------------------+
 //| SECTION 6: INITIALIZATION                                        |
 //+------------------------------------------------------------------+
@@ -843,8 +860,7 @@ void OnTick()
 {
    // V7.6 Fixes
    CheckPositionAgeTimeout();
-   ManageTrailingTP();
-      CleanupExpiredPendingStopOrders();
+   CleanupExpiredPendingStopOrders();
    //--- Expiry check
    if(IsEAExpired())
    {
@@ -880,7 +896,9 @@ void OnTick()
    
    //--- 4. POSITION MANAGEMENT (every tick)
    SyncPositionStates();
+   HandleHighSpreadOpenPositions();
    ManageTrailingStops();
+   ManageTrailingTP();
    ManagePartialClose();
    for(int i=0; i<PositionsTotal(); i++) HandleMultiLevelPartial(PositionGetTicket(i));
    
@@ -946,34 +964,61 @@ void UpdateEAState()
 {
    // FIXED: Get fresh count from broker, not cached value
    int mainCount = CountMainPositionsFromBroker();
-   int totalCount = CountAllOurPositions();
    double threat = CalculateMarketThreat();
    double drawdownPct = CalculateDrawdownPercent();
-   
-   // Determine state based on conditions
-   if(threat > 80 || drawdownPct > 10.0)
+
+   ENUM_EA_STATE oldState = g_eaState;
+   ENUM_EA_STATE newState = g_eaState;
+   bool enterExtreme = (threat > 80.0 || drawdownPct > 10.0);
+   bool canExitExtreme = (threat < 70.0 && drawdownPct < 7.0 && CountAllOurPositions() <= 1);
+
+   if(g_eaState == STATE_EXTREME_RISK)
    {
-      g_eaState = STATE_EXTREME_RISK;
+      if(canExitExtreme)
+         newState = STATE_IDLE;
+      else
+         newState = STATE_EXTREME_RISK;
+   }
+   else if(enterExtreme)
+   {
+      newState = STATE_EXTREME_RISK;
    }
    else if(drawdownPct > 7.0)
    {
-      g_eaState = STATE_DRAWDOWN_PROTECT;
+      newState = STATE_DRAWDOWN_PROTECT;
    }
    else if(CountRecoveryPositions() > 0)
    {
-      g_eaState = STATE_RECOVERY_ACTIVE;
+      newState = STATE_RECOVERY_ACTIVE;
    }
    else if(Count50PctReducedPositions() > 0)
    {
-      g_eaState = STATE_POSITION_REDUCED;
+      newState = STATE_POSITION_REDUCED;
    }
    else if(mainCount > 0)
    {
-      g_eaState = STATE_POSITION_ACTIVE;
+      newState = STATE_POSITION_ACTIVE;
    }
    else
    {
-      g_eaState = STATE_IDLE;
+      newState = STATE_IDLE;
+   }
+
+   g_prevEaState = oldState;
+   g_eaState = newState;
+
+   if(g_prevEaState == STATE_EXTREME_RISK && g_eaState != STATE_EXTREME_RISK)
+   {
+      if(ShouldPrintOncePerWindow("extreme_resolved", 60))
+      {
+         Print("Extreme risk resolved. Resuming normal operation.");
+         g_lastExtremeResolvedLogTime = TimeCurrent();
+         g_extremeResolvedLogged = true;
+      }
+   }
+   else if(g_eaState == STATE_EXTREME_RISK)
+   {
+      g_extremeResolvedLogged = false;
    }
 }
 //+------------------------------------------------------------------+
@@ -1013,13 +1058,8 @@ void HandleExtremeRisk()
          Print("EXTREME RISK: Closed oldest position ", oldestTicket);
    }
    
-   // Check if threat has reduced
-   double threat = CalculateMarketThreat();
-   if(threat < 70 && CountAllOurPositions() <= 1)
-   {
-      g_eaState = STATE_IDLE;
-      Print("Extreme risk resolved. Resuming normal operation.");
-   }
+    // Re-evaluate state using centralized hysteresis logic
+   UpdateEAState();
 }
 //+------------------------------------------------------------------+
 //| SECTION 10: POSITION COUNTING - FIXED!                           |
@@ -2541,6 +2581,74 @@ bool RunDecisionPipeline(DecisionResult &decision)
    return true;
 }
 //+------------------------------------------------------------------+
+bool IsSpreadHigh()
+{
+   if(!INPUT_ENABLE_HIGH_SPREAD_PROTECT)
+      return false;
+
+   double spreadPoints = (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   double spread = spreadPoints * g_point;
+   double avgSpread = (g_averageSpread > 0) ? g_averageSpread : spread;
+
+   if(avgSpread <= 0)
+      return false;
+
+   return (spread > avgSpread * INPUT_HIGH_SPREAD_MULTIPLIER);
+}
+//+------------------------------------------------------------------+
+bool ShouldPrintOncePerWindow(string key, int secondsWindow)
+{
+   static string keys[];
+   static datetime lastTimes[];
+
+   datetime now = TimeCurrent();
+   int count = ArraySize(keys);
+   for(int i = 0; i < count; i++)
+   {
+      if(keys[i] == key)
+      {
+         if(now - lastTimes[i] < secondsWindow)
+            return false;
+
+         lastTimes[i] = now;
+         return true;
+      }
+   }
+
+   ArrayResize(keys, count + 1);
+   ArrayResize(lastTimes, count + 1);
+   keys[count] = key;
+   lastTimes[count] = now;
+   return true;
+}
+//+------------------------------------------------------------------+
+void HandleHighSpreadOpenPositions()
+{
+   if(!IsSpreadHigh())
+      return;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !IsOurPosition(ticket))
+         continue;
+
+      double netProfit = PositionGetDouble(POSITION_PROFIT);
+
+      if(netProfit > 0.0 && INPUT_CLOSE_PROFIT_ON_HIGH_SPREAD)
+      {
+         if(g_trade.PositionClose(ticket))
+            Print("HIGH SPREAD: closed profitable position ", ticket);
+      }
+      else if(netProfit <= 0.0 && INPUT_KEEP_LOSS_STOPS_ON_HIGH_SPREAD)
+      {
+         string key = "high_spread_keep_" + IntegerToString((int)ticket);
+         if(ShouldPrintOncePerWindow(key, 60))
+            Print("HIGH SPREAD: loss position ", ticket, " - keeping original stops");
+      }
+   }
+}
+//+------------------------------------------------------------------+
 bool CheckAllGates(string &rejectReason)
 {
    // V7.2 FIX (BUG 3): Emergency zero?guard â€“ if maxPositions somehow reaches 0, reset to input default
@@ -2608,11 +2716,8 @@ bool CheckAllGates(string &rejectReason)
       return false;
    }
    
-   // Spread check â€“ more tolerant now
-   double spreadPoints = (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-   double spread = spreadPoints * g_point;
-   double avgSpread = (g_averageSpread > 0) ? g_averageSpread : spread;
-   if(avgSpread > 0 && spread > avgSpread * 5.0) // FIXED: changed from 3.0 to 5.0
+    // Spread check
+   if(IsSpreadHigh())
    {
       rejectReason = "Spread too high";
       return false;
@@ -2840,8 +2945,11 @@ double CalculateLotSize(double slPoints, double confidence, double threat, ENUM_
       }
    }
    
-   // Adaptive multiplier
+    // Adaptive multiplier
    lotSize *= g_adaptive.lotMultiplier;
+
+   if(INPUT_ENABLE_STREAK_LOT_MULTIPLIER && g_streakMultiplierOrdersRemaining > 0)
+      lotSize *= INPUT_STREAK_LOT_MULTIPLIER;
    
    // Round to lot step and clamp to limits
    lotSize = MathFloor(lotSize / g_lotStep) * g_lotStep;
@@ -3010,6 +3118,8 @@ bool ExecuteOrder(const DecisionResult &decision)
       g_lastOrderTime = TimeCurrent();
       g_daily.tradesPlaced++;
       g_totalTrades++;
+      if(INPUT_ENABLE_STREAK_LOT_MULTIPLIER && g_streakMultiplierOrdersRemaining > 0)
+         g_streakMultiplierOrdersRemaining--;
       return true;
    }
 
@@ -3055,7 +3165,9 @@ bool ExecuteOrder(const DecisionResult &decision)
          g_lastOrderTime = TimeCurrent();
          g_daily.tradesPlaced++;
          g_totalTrades++;
-         
+         if(INPUT_ENABLE_STREAK_LOT_MULTIPLIER && g_streakMultiplierOrdersRemaining > 0)
+            g_streakMultiplierOrdersRemaining--;
+
          return true;
       }
       
@@ -3274,6 +3386,17 @@ void ManagePartialClose()
 //+------------------------------------------------------------------+
 void MoveToBreakeven(ulong ticket, double entryPrice, int posType)
 {
+   if(IsSpreadHigh() && INPUT_KEEP_LOSS_STOPS_ON_HIGH_SPREAD)
+   {
+      if(PositionSelectByTicket(ticket) && PositionGetDouble(POSITION_PROFIT) <= 0.0)
+      {
+         string key = "high_spread_keep_" + IntegerToString((int)ticket);
+         if(ShouldPrintOncePerWindow(key, 60))
+            Print("HIGH SPREAD: loss position ", ticket, " - keeping original stops");
+         return;
+      }
+   }
+
    if(!CanModifyPosition(ticket)) return;
    
    double currentSL = PositionGetDouble(POSITION_SL);
@@ -3317,9 +3440,21 @@ void ManageTrailingStops()
    int total = PositionsTotal();
    for(int i = 0; i < total; i++)
    {
-      ulong ticket = PositionGetTicket(i);
+       ulong ticket = PositionGetTicket(i);
       if(ticket == 0) continue;
       if(!IsOurPosition(ticket)) continue;
+
+      if(IsSpreadHigh() && INPUT_KEEP_LOSS_STOPS_ON_HIGH_SPREAD)
+      {
+         double netProfit = PositionGetDouble(POSITION_PROFIT);
+         if(netProfit <= 0.0)
+         {
+            string key = "high_spread_keep_" + IntegerToString((int)ticket);
+            if(ShouldPrintOncePerWindow(key, 60))
+               Print("HIGH SPREAD: loss position ", ticket, " - keeping original stops");
+            continue;
+         }
+      }
       
       double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
       double currentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
@@ -3620,6 +3755,17 @@ void ProcessClosedPositions()
          g_consecutiveLosses = 0;
          g_daily.winsToday++;
          g_daily.profitToday += netProfit;
+
+         if(INPUT_ENABLE_STREAK_LOT_MULTIPLIER &&
+            g_consecutiveWins >= INPUT_STREAK_TRIGGER_WINS &&
+            dealTicket != g_lastStreakActivatedDeal)
+         {
+            g_streakMultiplierOrdersRemaining = INPUT_STREAK_MULTIPLIER_ORDERS;
+            g_lastStreakActivatedDeal = dealTicket;
+            Print("STREAK LOT MULTIPLIER ACTIVATED: wins=", g_consecutiveWins,
+                  " | multiplier=", DoubleToString(INPUT_STREAK_LOT_MULTIPLIER, 2),
+                  " | boosted orders=", g_streakMultiplierOrdersRemaining);
+         }
       }
       else
       {
@@ -3627,6 +3773,9 @@ void ProcessClosedPositions()
          g_consecutiveWins = 0;
          g_daily.lossesToday++;
          g_daily.lossToday += MathAbs(netProfit);
+
+         if(INPUT_ENABLE_STREAK_LOT_MULTIPLIER)
+            g_streakMultiplierOrdersRemaining = 0;
       }
       
       // Markov update (if enabled)
@@ -4483,9 +4632,14 @@ void DrawStatsPanel()
    CreateLabel(prefix + "pnl", "P&L Today: " + DoubleToString(netToday, 2), x + 10, y, plColor, 9);
    y += 18;
    
-   // Streak
-   CreateLabel(prefix + "streak", "Streak: W" + IntegerToString(g_consecutiveWins) +
+      CreateLabel(prefix + "streak", "Streak: W" + IntegerToString(g_consecutiveWins) +
                " / L" + IntegerToString(g_consecutiveLosses),
+               x + 10, y, txtColor, 9);
+   y += 18;
+
+   CreateLabel(prefix + "streakBoost", "Streak Boost -> Trigger:" + IntegerToString(INPUT_STREAK_TRIGGER_WINS) +
+               "W | Mult:" + DoubleToString(INPUT_STREAK_LOT_MULTIPLIER, 2) +
+               "x | Remaining:" + IntegerToString(g_streakMultiplierOrdersRemaining),
                x + 10, y, txtColor, 9);
    y += 18;
    
@@ -4599,7 +4753,19 @@ void ManageTrailingTP()
       ulong ticket = PositionGetTicket(i);
       if(!IsOurPosition(ticket)) continue;
       if(!PositionSelectByTicket(ticket)) continue;
-      
+
+      if(IsSpreadHigh() && INPUT_KEEP_LOSS_STOPS_ON_HIGH_SPREAD)
+      {
+         double netProfit = PositionGetDouble(POSITION_PROFIT);
+         if(netProfit <= 0.0)
+         {
+            string key = "high_spread_keep_" + IntegerToString((int)ticket);
+            if(ShouldPrintOncePerWindow(key, 60))
+               Print("HIGH SPREAD: loss position ", ticket, " - keeping original stops");
+            continue;
+         }
+      }
+
       double tp = PositionGetDouble(POSITION_TP);
       double current = PositionGetDouble(POSITION_PRICE_CURRENT);
       double entry = PositionGetDouble(POSITION_PRICE_OPEN);
@@ -4641,3 +4807,4 @@ void HandleMultiLevelPartial(ulong ticket)
       g_trade.PositionClosePartial(ticket, NormalizeDouble(vol * 0.25, 2)); 
    }
 }
+
