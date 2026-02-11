@@ -112,6 +112,7 @@ input group    "=== High Spread Protection ==="
 input bool     INPUT_ENABLE_HIGH_SPREAD_PROTECT = true;
 input double   INPUT_HIGH_SPREAD_MULTIPLIER = 5.0;
 input bool     INPUT_CLOSE_PROFIT_ON_HIGH_SPREAD = true;
+input double   INPUT_HIGH_SPREAD_CLOSE_PERCENT = 50.0;
 input bool     INPUT_KEEP_LOSS_STOPS_ON_HIGH_SPREAD = true;
 //--- Equity Protection
 input group    "=== Equity Protection ==="
@@ -291,6 +292,7 @@ struct PositionState
    bool     lotReduced;         // 50% lot already closed
    bool     partialClosed;      // Partial close at TP% done
    bool     movedToBreakeven;   // SL moved to breakeven
+      bool     highSpreadClosed;   // High-spread profit partial close done
    int      recoveryCount;      // How many recovery orders placed
    datetime lastRecoveryTime;   // Last recovery order time
    bool     isActive;           // Position still open
@@ -2626,6 +2628,10 @@ void HandleHighSpreadOpenPositions()
 {
    if(!IsSpreadHigh())
       return;
+ double closePercent = MathMax(0.0, MathMin(100.0, INPUT_HIGH_SPREAD_CLOSE_PERCENT));
+   double closeRatio = closePercent / 100.0;
+   if(closeRatio <= 0.0)
+      return;
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -2633,12 +2639,55 @@ void HandleHighSpreadOpenPositions()
       if(ticket == 0 || !IsOurPosition(ticket))
          continue;
 
+       int trackedIdx = -1;
+      for(int j = 0; j < g_positionCount; j++)
+      {
+         if(g_positions[j].isActive && g_positions[j].ticket == ticket)
+         {
+            trackedIdx = j;
+            break;
+         }
+      }
+
+      if(trackedIdx >= 0 && g_positions[trackedIdx].highSpreadClosed)
+         continue;
+
       double netProfit = PositionGetDouble(POSITION_PROFIT);
+      double currentLots = PositionGetDouble(POSITION_VOLUME);
 
       if(netProfit > 0.0 && INPUT_CLOSE_PROFIT_ON_HIGH_SPREAD)
       {
-         if(g_trade.PositionClose(ticket))
-            Print("HIGH SPREAD: closed profitable position ", ticket);
+         double lotsToClose = currentLots * closeRatio;
+         lotsToClose = MathFloor(lotsToClose / g_lotStep) * g_lotStep;
+         lotsToClose = MathMax(lotsToClose, g_minLot);
+
+         if(lotsToClose >= currentLots)
+         {
+            if(g_trade.PositionClose(ticket))
+            {
+               if(trackedIdx >= 0)
+               {
+                  g_positions[trackedIdx].highSpreadClosed = true;
+                  g_positions[trackedIdx].currentLots = 0;
+               }
+               Print("HIGH SPREAD: fully closed profitable position ", ticket,
+                     " | close%=", DoubleToString(closePercent, 1));
+            }
+         }
+         else if(lotsToClose >= g_minLot)
+         {
+            if(g_trade.PositionClosePartial(ticket, lotsToClose))
+            {
+               if(trackedIdx >= 0)
+               {
+                  g_positions[trackedIdx].highSpreadClosed = true;
+                  g_positions[trackedIdx].currentLots = currentLots - lotsToClose;
+               }
+               Print("HIGH SPREAD: partial close on profitable position ", ticket,
+                     " | ClosedLots=", DoubleToString(lotsToClose, 2),
+                     " | close%=", DoubleToString(closePercent, 1));
+            }
+         }
       }
       else if(netProfit <= 0.0 && INPUT_KEEP_LOSS_STOPS_ON_HIGH_SPREAD)
       {
@@ -3229,6 +3278,7 @@ void TrackNewPosition(ulong positionTicket, const DecisionResult &decision, stri
    g_positions[idx].lotReduced = false;
    g_positions[idx].partialClosed = false;
    g_positions[idx].movedToBreakeven = false;
+   g_positions[idx].highSpreadClosed = false;
    g_positions[idx].recoveryCount = 0;
    g_positions[idx].lastRecoveryTime = 0;
    g_positions[idx].isActive = true;
@@ -3707,6 +3757,7 @@ void SyncExistingPositions()
       g_positions[idx].lotReduced = false;
       g_positions[idx].partialClosed = false;
       g_positions[idx].movedToBreakeven = false;
+          g_positions[idx].highSpreadClosed = false;
       g_positions[idx].recoveryCount = 0;
       g_positions[idx].lastRecoveryTime = 0;
       g_positions[idx].isActive = true;
@@ -3725,11 +3776,13 @@ void ProcessClosedPositions()
       return;
    
    int dealsTotal = HistoryDealsTotal();
-   for(int i = dealsTotal - 1; i >= 0; i--)
+    ulong newestProcessedDeal = g_lastProcessedDealTicket;
+
+   for(int i = 0; i < dealsTotal; i++)
    {
       ulong dealTicket = HistoryDealGetTicket(i);
       if(dealTicket == 0) continue;
-      if(dealTicket <= g_lastProcessedDealTicket) break;
+      if(dealTicket <= g_lastProcessedDealTicket) continue;
       
       if(HistoryDealGetString(dealTicket, DEAL_SYMBOL) != _Symbol) continue;
       if(HistoryDealGetInteger(dealTicket, DEAL_MAGIC) != INPUT_MAGIC_NUMBER) continue;
@@ -3799,7 +3852,8 @@ void ProcessClosedPositions()
       if(INPUT_ENABLE_ML)
            RecordTrainingData(posId, dealTicket, netProfit, isWin);
       
-      g_lastProcessedDealTicket = dealTicket;
+           if(dealTicket > newestProcessedDeal)
+         newestProcessedDeal = dealTicket;
       
       Print("CLOSED DEAL: DealTicket ", dealTicket,
             " | PositionTicket: ", posId,
@@ -3807,6 +3861,7 @@ void ProcessClosedPositions()
             " | Win: ", isWin, " | ConsWin: ", g_consecutiveWins,
             " | ConsLoss: ", g_consecutiveLosses);
    }
+     g_lastProcessedDealTicket = newestProcessedDeal;
 }
 //+------------------------------------------------------------------+
 int GetSessionFromTime(datetime ts)
