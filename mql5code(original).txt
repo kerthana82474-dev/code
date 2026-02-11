@@ -249,6 +249,7 @@ input bool     INPUT_ENABLE_ALERTS    = false;    // Enable alert notifications
 #define Q_TABLE_STATES            108
 #define Q_TABLE_ACTIONS           4
 #define MARKOV_STATES             3
+#define MIN_SPREAD_SAMPLES        20
 //+------------------------------------------------------------------+
 //| SECTION 4: STRUCTURES                                            |
 //+------------------------------------------------------------------+
@@ -549,9 +550,37 @@ int OnInit()
       Print("ERROR: INPUT_MIN_SIGNALS must be 1-8");
       return INIT_PARAMETERS_INCORRECT;
    }
-   if(INPUT_MIN_CONFIDENCE < 0 || INPUT_MIN_CONFIDENCE > 100)
+    if(INPUT_MIN_CONFIDENCE < 0 || INPUT_MIN_CONFIDENCE > 100)
    {
       Print("ERROR: INPUT_MIN_CONFIDENCE must be 0-100");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(INPUT_ENABLE_STREAK_LOT_MULTIPLIER)
+   {
+      if(INPUT_STREAK_TRIGGER_WINS < 1)
+      {
+         Print("ERROR: INPUT_STREAK_TRIGGER_WINS must be >= 1");
+         return INIT_PARAMETERS_INCORRECT;
+      }
+      if(INPUT_STREAK_MULTIPLIER_ORDERS < 1)
+      {
+         Print("ERROR: INPUT_STREAK_MULTIPLIER_ORDERS must be >= 1");
+         return INIT_PARAMETERS_INCORRECT;
+      }
+      if(INPUT_STREAK_LOT_MULTIPLIER <= 1.0)
+      {
+         Print("ERROR: INPUT_STREAK_LOT_MULTIPLIER must be > 1.0 when enabled");
+         return INIT_PARAMETERS_INCORRECT;
+      }
+   }
+   if(INPUT_ENABLE_HIGH_SPREAD_PROTECT && INPUT_HIGH_SPREAD_MULTIPLIER <= 1.0)
+   {
+      Print("ERROR: INPUT_HIGH_SPREAD_MULTIPLIER must be > 1.0 when high spread protection is enabled");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(INPUT_HIGH_SPREAD_CLOSE_PERCENT < 0.0 || INPUT_HIGH_SPREAD_CLOSE_PERCENT > 100.0)
+   {
+      Print("ERROR: INPUT_HIGH_SPREAD_CLOSE_PERCENT must be within 0..100");
       return INIT_PARAMETERS_INCORRECT;
    }
    if(INPUT_AI_MODE != AI_OFF && StringLen(INPUT_AI_API_KEY) < 3)
@@ -567,13 +596,16 @@ int OnInit()
    g_point        = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    g_tickSize     = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
    g_tickValue    = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   g_lotStep      = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+     g_lotStep      = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
    g_minLot       = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    g_maxLot       = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    g_digits       = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    g_contractSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
    g_stopLevel    = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   g_freezeLevel  = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+    g_freezeLevel  = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+
+   if(!MathIsValidNumber(g_lotStep) || g_lotStep <= 0.0)
+      g_lotStep = 0.01;
     bool invalidTickValue    = (!MathIsValidNumber(g_tickValue)    || g_tickValue <= 0.0);
    bool invalidTickSize     = (!MathIsValidNumber(g_tickSize)     || g_tickSize <= 0.0);
    bool invalidContractSize = (!MathIsValidNumber(g_contractSize) || g_contractSize <= 0.0);
@@ -2588,8 +2620,18 @@ bool IsSpreadHigh()
    if(!INPUT_ENABLE_HIGH_SPREAD_PROTECT)
       return false;
 
+   if(INPUT_HIGH_SPREAD_MULTIPLIER <= 1.0)
+      return false;
+
    double spreadPoints = (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
    double spread = spreadPoints * g_point;
+
+   if(spread <= 0.0)
+      return false;
+
+   if(g_spreadSamples < MIN_SPREAD_SAMPLES)
+      return false;
+
    double avgSpread = (g_averageSpread > 0) ? g_averageSpread : spread;
 
    if(avgSpread <= 0)
@@ -2950,6 +2992,10 @@ int GetCurrentSession()
 double CalculateLotSize(double slPoints, double confidence, double threat, ENUM_RL_ACTION rlAction)
 {
    if(slPoints <= 0) return 0;
+
+   double lotStep = g_lotStep;
+   if(!MathIsValidNumber(lotStep) || lotStep <= 0.0)
+      lotStep = 0.01;
    
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    double riskMoney = balance * (g_risk.riskPercent / 100.0);
@@ -2997,11 +3043,13 @@ double CalculateLotSize(double slPoints, double confidence, double threat, ENUM_
     // Adaptive multiplier
    lotSize *= g_adaptive.lotMultiplier;
 
-   if(INPUT_ENABLE_STREAK_LOT_MULTIPLIER && g_streakMultiplierOrdersRemaining > 0)
+   if(INPUT_ENABLE_STREAK_LOT_MULTIPLIER &&
+      g_streakMultiplierOrdersRemaining > 0 &&
+      INPUT_STREAK_LOT_MULTIPLIER > 1.0)
       lotSize *= INPUT_STREAK_LOT_MULTIPLIER;
-   
+
    // Round to lot step and clamp to limits
-   lotSize = MathFloor(lotSize / g_lotStep) * g_lotStep;
+   lotSize = MathFloor(lotSize / lotStep) * lotStep;
    lotSize = MathMax(lotSize, g_risk.minLot);
    lotSize = MathMin(lotSize, g_risk.maxLot);
    lotSize = MathMax(lotSize, g_minLot);
@@ -3016,7 +3064,7 @@ double CalculateLotSize(double slPoints, double confidence, double threat, ENUM_
    if(marginRequired > freeMargin * 0.8)
    {
       lotSize = (freeMargin * 0.5) / (marginRequired / lotSize);
-      lotSize = MathFloor(lotSize / g_lotStep) * g_lotStep;
+            lotSize = MathFloor(lotSize / lotStep) * lotStep;
       if(lotSize < g_minLot) return 0;
    }
    
@@ -4206,9 +4254,13 @@ void CheckDailyReset()
 void UpdateAverageSpread()
 {
    double currentSpread = (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) * g_point;
+   if(currentSpread <= 0.0)
+      return;
+
    g_totalSpread += currentSpread;
    g_spreadSamples++;
    g_averageSpread = g_totalSpread / g_spreadSamples;
+   
    
    if(g_spreadSamples > 10000)
    {
