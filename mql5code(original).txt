@@ -101,9 +101,16 @@ input double   INPUT_RISK_PERCENT          = 1.0; // Risk % per trade (0=use pro
 input double   INPUT_MAX_LOT_SIZE          = 5.0; // Maximum lot size
 input double   INPUT_MIN_LOT_SIZE          = 0.01;// Minimum lot size
 input double   INPUT_MAX_TOTAL_RISK_PERCENT = 5.0;// Max total portfolio risk %
+input bool     INPUT_USE_FIXED_LOT_SIZE    = false; // Use fixed lot sizing instead of risk-based lot sizing
+input double   INPUT_FIXED_LOT_SIZE        = 0.10;  // Fixed lot size when enabled
+input bool     INPUT_FIXED_LOT_APPLY_SCALING = false; // Apply scaling factors even when fixed lot mode is enabled
 //--- Money Management / Streak Multiplier
 input group    "=== Money Management / Streak Multiplier ==="
-input bool     INPUT_ENABLE_DYNAMIC_LOT_SCALING = true; // Apply dynamic lot scaling (threat/confidence/RL/adaptive)
+input bool     INPUT_LOT_SCALE_THREAT      = true; // Apply threat-based lot scaling
+input bool     INPUT_LOT_SCALE_CONFIDENCE  = true; // Apply confidence-based lot scaling
+input bool     INPUT_LOT_SCALE_RL          = true; // Apply RL action-based lot scaling
+input bool     INPUT_LOT_SCALE_ADAPTIVE    = true; // Apply adaptive lot multiplier
+input bool     INPUT_LOT_SCALE_STREAK      = true; // Apply streak multiplier to lot size
 input bool     INPUT_ENABLE_STREAK_LOT_MULTIPLIER = true;
 input int      INPUT_STREAK_TRIGGER_WINS = 2;
 input double   INPUT_STREAK_LOT_MULTIPLIER = 1.5;
@@ -184,7 +191,8 @@ input double   INPUT_RL_ALPHA           = 0.1;    // Learning rate (alpha)
 input double   INPUT_RL_GAMMA           = 0.9;    // Discount factor (gamma)
 input double   INPUT_RL_EPSILON         = 0.1;    // Exploration rate (epsilon)
 input int      INPUT_RL_MIN_TRADES      = 20;     // Min trades before RL applies
-input double   INPUT_RL_WEIGHT          = 0.3;    // RL weight in final decision (0-1)
+input double   INPUT_RL_WEIGHT          = 0.3;    // RL weight in final decision (0-1
+input bool     INPUT_RL_CAN_SKIP_TRADE  = true;   // Allow RL skip action to block trade entry
 //--- Markov Chain Analysis
 input group    "=== Markov Chain Analysis ==="
 input bool     INPUT_ENABLE_MARKOV      = false;  // Enable Markov chain analysis (FIXED: Disabled for backtesting)
@@ -577,6 +585,11 @@ int OnInit()
    else
    {
       g_streakMultiplierOrdersRemaining = 0;
+   }
+      if(INPUT_USE_FIXED_LOT_SIZE && INPUT_FIXED_LOT_SIZE <= 0.0)
+   {
+      Print("ERROR: INPUT_FIXED_LOT_SIZE must be > 0 when fixed lot mode is enabled");
+      return INIT_PARAMETERS_INCORRECT;
    }
    if(INPUT_ENABLE_HIGH_SPREAD_PROTECT && INPUT_HIGH_SPREAD_MULTIPLIER <= 1.0)
    {
@@ -2558,13 +2571,13 @@ bool RunDecisionPipeline(DecisionResult &decision)
                                                positions, drawdown);
    
    // Honor RL skip decision
-   if(INPUT_ENABLE_RL && rlAction == RL_SKIP_TRADE && g_rlTradesCompleted >= INPUT_RL_MIN_TRADES)
+   if(INPUT_ENABLE_RL && INPUT_RL_CAN_SKIP_TRADE && rlAction == RL_SKIP_TRADE && g_rlTradesCompleted >= INPUT_RL_MIN_TRADES)
    {
       // Randomised skip based on RL weight (default weight = 0.3)
       if((double)MathRand() / 32767.0 < INPUT_RL_WEIGHT)
       {
          if(INPUT_ENABLE_LOGGING)
-            Print("RL decided to skip trade");
+            Print("RL decided to skip trade (INPUT_RL_CAN_SKIP_TRADE=ON)");
          return false;
       }
    }
@@ -3007,29 +3020,40 @@ double CalculateLotSize(double slPoints, double confidence, double threat, ENUM_
    if(!MathIsValidNumber(lotStep) || lotStep <= 0.0)
       lotStep = 0.01;
 
-   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   double riskMoney = balance * (g_risk.riskPercent / 100.0);
-   if(riskMoney <= 0.0)
-      return 0.0;
 
-   double slValue = slPoints * g_point;
    double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double lotSize = 0.0;
+      bool fixedLotMode = INPUT_USE_FIXED_LOT_SIZE;
 
    // Preferred risk sizing via OrderCalcProfit (instrument-aware)
-   double testProfit = 0.0;
-   if(OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, 1.0, price, price - slValue, testProfit))
+   if(fixedLotMode)
    {
-      if(MathAbs(testProfit) > 0.0)
-         lotSize = riskMoney / MathAbs(testProfit);
+      lotSize = INPUT_FIXED_LOT_SIZE;
    }
+   else
+   {
+      double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+      double riskMoney = balance * (g_risk.riskPercent / 100.0);
+      if(riskMoney <= 0.0)
+         return 0.0;
 
-   // Fallback risk sizing via tick value/size
-   if((!MathIsValidNumber(lotSize) || lotSize <= 0.0) && g_tickSize > 0.0)
-      lotSize = riskMoney / (slPoints * (g_tickValue / g_tickSize) * g_point);
+    double slValue = slPoints * g_point;
 
-   if(!MathIsValidNumber(lotSize) || lotSize <= 0.0)
-      return 0.0;
+   // Preferred risk sizing via OrderCalcProfit (instrument-aware)
+      double testProfit = 0.0;
+      if(OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, 1.0, price, price - slValue, testProfit))
+      {
+         if(MathAbs(testProfit) > 0.0)
+            lotSize = riskMoney / MathAbs(testProfit);
+      }
+
+      // Fallback risk sizing via tick value/size
+      if((!MathIsValidNumber(lotSize) || lotSize <= 0.0) && g_tickSize > 0.0)
+         lotSize = riskMoney / (slPoints * (g_tickValue / g_tickSize) * g_point);
+
+      if(!MathIsValidNumber(lotSize) || lotSize <= 0.0)
+         return 0.0;
+   }
 
    double baseLot = lotSize;
 
@@ -3040,30 +3064,36 @@ double CalculateLotSize(double slPoints, double confidence, double threat, ENUM_
    double adaptiveFactor = 1.0;
    double streakFactor = 1.0;
 
-   if(INPUT_ENABLE_DYNAMIC_LOT_SCALING)
+     bool scalingAllowed = (!fixedLotMode || INPUT_FIXED_LOT_APPLY_SCALING);
+
+   if(scalingAllowed && INPUT_LOT_SCALE_THREAT)
    {
       threatFactor = 1.0 - (threat / 200.0);
       threatFactor = MathMax(threatFactor, 0.25);
+   }
 
+   if(scalingAllowed && INPUT_LOT_SCALE_CONFIDENCE)
+   {
       confFactor = 0.5 + (confidence / 200.0);
-
-      if(INPUT_ENABLE_RL)
+   }
+    if(scalingAllowed && INPUT_LOT_SCALE_RL && INPUT_ENABLE_RL)
+   {
+      switch(rlAction)
       {
-         switch(rlAction)
-         {
-            case RL_HALF_SIZE:    rlFactor = 0.5;  break;
-            case RL_QUARTER_SIZE: rlFactor = 0.25; break;
-            case RL_SKIP_TRADE:   return 0.0;
-            default: break;
-         }
+         case RL_HALF_SIZE:    rlFactor = 0.5;  break;
+         case RL_QUARTER_SIZE: rlFactor = 0.25; break;
+         case RL_SKIP_TRADE:   rlFactor = 1.0;  break; // Skip handled independently by INPUT_RL_CAN_SKIP_TRADE
+         default: break;
       }
+   }
 
+   if(scalingAllowed && INPUT_LOT_SCALE_ADAPTIVE)
+   {
       adaptiveFactor = g_adaptive.lotMultiplier;
       if(!MathIsValidNumber(adaptiveFactor) || adaptiveFactor <= 0.0)
          adaptiveFactor = 1.0;
    }
-
-   if(INPUT_ENABLE_STREAK_LOT_MULTIPLIER &&
+ if(scalingAllowed && INPUT_LOT_SCALE_STREAK && INPUT_ENABLE_STREAK_LOT_MULTIPLIER &&
       g_streakMultiplierOrdersRemaining > 0 &&
       INPUT_STREAK_LOT_MULTIPLIER > 1.0)
    {
@@ -3079,7 +3109,14 @@ double CalculateLotSize(double slPoints, double confidence, double threat, ENUM_
    if(INPUT_ENABLE_LOGGING)
    {
       Print("LOT BREAKDOWN | Base=", DoubleToString(baseLot, 4),
-            " | Dynamic=", (INPUT_ENABLE_DYNAMIC_LOT_SCALING ? "ON" : "OFF"),
+            " | FixedLotMode=", (fixedLotMode ? "ON" : "OFF"),
+            " | FixedLotApplyScaling=", (INPUT_FIXED_LOT_APPLY_SCALING ? "ON" : "OFF"),
+            " | ScaleThreat=", (INPUT_LOT_SCALE_THREAT ? "ON" : "OFF"),
+            " | ScaleConf=", (INPUT_LOT_SCALE_CONFIDENCE ? "ON" : "OFF"),
+            " | ScaleRL=", (INPUT_LOT_SCALE_RL ? "ON" : "OFF"),
+            " | ScaleAdaptive=", (INPUT_LOT_SCALE_ADAPTIVE ? "ON" : "OFF"),
+            " | ScaleStreak=", (INPUT_LOT_SCALE_STREAK ? "ON" : "OFF"),
+            " | RLCanSkip=", (INPUT_RL_CAN_SKIP_TRADE ? "ON" : "OFF"),
             " | ThreatF=", DoubleToString(threatFactor, 3),
             " | ConfF=", DoubleToString(confFactor, 3),
             " | RLF=", DoubleToString(rlFactor, 3),
