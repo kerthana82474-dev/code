@@ -1604,9 +1604,30 @@ int ParseCSVToArray(string csv, double &outArray[], int maxElements = 10)
       }
    }
    
-   return count;
+    return count;
 }
 
+//+------------------------------------------------------------------+
+//| V7.33: Convert part arrays to readable log text                  |
+//+------------------------------------------------------------------+
+string FormatDoubleArray(const double &values[], int count)
+{
+   if(count <= 0)
+      return "[]";
+
+   int safeCount = MathMin(count, ArraySize(values));
+   string result = "[";
+
+   for(int i = 0; i < safeCount; i++)
+   {
+      if(i > 0)
+         result += ",";
+      result += DoubleToString(values[i], 2);
+   }
+
+   result += "]";
+   return result;
+}
 //+------------------------------------------------------------------+
 //| V7.33: Validate and normalize percentage arrays                  |
 //+------------------------------------------------------------------+
@@ -1675,12 +1696,12 @@ void ValidatePartialCloseArrays()
    for(int i = 0; i < g_profitPartsCount; i++) sumProfitEff += g_profitPartPercentages[i];
 
    Print("PARTIAL CONFIG EFFECTIVE: lossCount=", g_lossPartsCount,
-         " | lossTriggers=", ArrayToString(g_lossPartTriggers, 0, g_lossPartsCount),
-         " | lossPerc=", ArrayToString(g_lossPartPercentages, 0, g_lossPartsCount),
+         " | lossTriggers=", FormatDoubleArray(g_lossPartTriggers, g_lossPartsCount),
+         " | lossPerc=", FormatDoubleArray(g_lossPartPercentages, g_lossPartsCount),
          " | lossSum=", DoubleToString(sumLossEff, 2));
    Print("PARTIAL CONFIG EFFECTIVE: profitCount=", g_profitPartsCount,
-         " | profitTriggers=", ArrayToString(g_profitPartTriggers, 0, g_profitPartsCount),
-         " | profitPerc=", ArrayToString(g_profitPartPercentages, 0, g_profitPartsCount),
+         " | profitTriggers=", FormatDoubleArray(g_profitPartTriggers, g_profitPartsCount),
+         " | profitPerc=", FormatDoubleArray(g_profitPartPercentages, g_profitPartsCount),
          " | profitSum=", DoubleToString(sumProfitEff, 2),
          " | basis=", EnumToString(INPUT_PARTIAL_CLOSE_BASIS),
          " | example(1lot:33/33/34)=", (INPUT_PARTIAL_CLOSE_BASIS == CLOSE_BASIS_ORIGINAL ? "0.33+0.33+remainder" : "0.33 then 33% of remaining then 34% of remaining"));
