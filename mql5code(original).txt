@@ -898,7 +898,55 @@ void RefreshSymbolTradeConstraints()
       g_freezeLevel = freezeNow;
    }
 }
+void RefreshSymbolEconomics()
+{
+   static datetime lastRefresh = 0;
+   datetime now = TimeCurrent();
+   if(lastRefresh != 0 && (now - lastRefresh) < 3600)
+      return;
+   lastRefresh = now;
 
+   double tickValueNow = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSizeNow = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double pointNow = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double contractSizeNow = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+
+   bool changed = false;
+   if(MathIsValidNumber(tickValueNow) && tickValueNow > 0.0 && MathAbs(tickValueNow - g_tickValue) > 1e-12)
+   {
+      if(INPUT_ENABLE_LOGGING)
+         Print("SYMBOL ECONOMICS CHANGE: tickValue ", DoubleToString(g_tickValue, 10), "->", DoubleToString(tickValueNow, 10));
+      g_tickValue = tickValueNow;
+      changed = true;
+   }
+
+   if(MathIsValidNumber(tickSizeNow) && tickSizeNow > 0.0 && MathAbs(tickSizeNow - g_tickSize) > 1e-12)
+   {
+      if(INPUT_ENABLE_LOGGING)
+         Print("SYMBOL ECONOMICS CHANGE: tickSize ", DoubleToString(g_tickSize, 10), "->", DoubleToString(tickSizeNow, 10));
+      g_tickSize = tickSizeNow;
+      changed = true;
+   }
+
+   if(MathIsValidNumber(pointNow) && pointNow > 0.0 && MathAbs(pointNow - g_point) > 1e-12)
+   {
+      if(INPUT_ENABLE_LOGGING)
+         Print("SYMBOL ECONOMICS CHANGE: point ", DoubleToString(g_point, 10), "->", DoubleToString(pointNow, 10));
+      g_point = pointNow;
+      changed = true;
+   }
+
+   if(MathIsValidNumber(contractSizeNow) && contractSizeNow > 0.0 && MathAbs(contractSizeNow - g_contractSize) > 1e-8)
+   {
+      if(INPUT_ENABLE_LOGGING)
+         Print("SYMBOL ECONOMICS CHANGE: contractSize ", DoubleToString(g_contractSize, 2), "->", DoubleToString(contractSizeNow, 2));
+      g_contractSize = contractSizeNow;
+      changed = true;
+   }
+
+   if(changed)
+      RegisterDataWarning("Symbol economics refreshed due to broker value change");
+}
 bool IsFiniteInRange(double value, double minValue, double maxValue)
 {
    return (MathIsValidNumber(value) && value >= minValue && value <= maxValue);
@@ -925,46 +973,67 @@ double NormalizeVolumeToStep(double lots)
    if(!MathIsValidNumber(lots) || lots <= 0.0 || !MathIsValidNumber(step) || step <= 0.0)
       return 0.0;
 
-   double aligned = MathFloor((lots + 1e-12) / step) * step;
+
+    double aligned = MathRound((lots + 1e-10) / step) * step;
    return NormalizeDouble(aligned, g_lotDigits);
 }
 
 bool NormalizeAndValidateOrderVolume(double requestedLots, double &normalizedLots, string &reason)
 {
    reason = "";
-   normalizedLots = NormalizeVolumeToStep(requestedLots);
-   if(normalizedLots <= 0.0)
+   normalizedLots = 0.0;
+
+   // Pull effective broker limits
+   double step      = GetEffectiveLotStep();
+   double brokerMin = g_minLot;
+   double brokerMax = g_maxLot;
+
+   // Defensive defaults if something wasn't initialized
+   if(!MathIsValidNumber(step) || step <= 0.0) step = 0.01;
+   if(!MathIsValidNumber(brokerMin) || brokerMin <= 0.0) brokerMin = 0.01;
+   if(!MathIsValidNumber(brokerMax) || brokerMax <= 0.0) brokerMax = 100.0;
+
+   // EA-configured caps (inputs)
+   double eaMin = (INPUT_MIN_LOT_SIZE > 0.0 ? INPUT_MIN_LOT_SIZE : brokerMin);
+   double eaMax = (INPUT_MAX_LOT_SIZE > 0.0 ? INPUT_MAX_LOT_SIZE : brokerMax);
+
+   // Ensure EA limits don't violate broker constraints
+   if(eaMin < brokerMin) eaMin = brokerMin;
+   if(eaMax > brokerMax) eaMax = brokerMax;
+   if(eaMax < eaMin) eaMax = eaMin;
+
+   // 1) Sanitize requestedLots (NEVER block signals due to 0/NaN; fallback instead)
+   if(!MathIsValidNumber(requestedLots) || requestedLots <= 0.0)
    {
-      reason = "non-positive or non-finite normalized lot";
+      reason = "requested lot invalid -> fallback to min";
+      requestedLots = eaMin;
+   }
+
+   // 2) Clamp into [eaMin..eaMax]
+   double lots = requestedLots;
+   if(lots < eaMin) lots = eaMin;
+   if(lots > eaMax) lots = eaMax;
+
+   // 3) Normalize to step (floor is safer to avoid accidental oversize)
+   lots = MathFloor(lots / step) * step;
+
+   // Sometimes floor can push below min because of floating error
+   if(lots < eaMin) lots = eaMin;
+
+   // 4) Final numeric normalization
+   lots = NormalizeDouble(lots, g_lotDigits);
+
+   // Final guard
+   if(!MathIsValidNumber(lots) || lots < eaMin || lots > eaMax)
+   {
+      reason = "normalization failed after clamp";
       return false;
    }
 
-   normalizedLots = MathMax(normalizedLots, g_risk.minLot);
-   normalizedLots = MathMin(normalizedLots, g_risk.maxLot);
-   normalizedLots = MathMax(normalizedLots, g_minLot);
-   normalizedLots = MathMin(normalizedLots, g_maxLot);
-   normalizedLots = NormalizeVolumeToStep(normalizedLots);
-
-   if(!MathIsValidNumber(normalizedLots) || normalizedLots < g_minLot || normalizedLots > g_maxLot)
-   {
-      reason = "outside broker min/max volume bounds";
-      return false;
-   }
-
-   double volumeLimit = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_LIMIT);
-   if(MathIsValidNumber(volumeLimit) && volumeLimit > 0.0 && normalizedLots > volumeLimit)
-   {
-      double capped = NormalizeVolumeToStep(volumeLimit);
-      if(capped < g_minLot)
-      {
-         reason = "symbol volume limit below minimum tradable lot";
-         return false;
-      }
-      normalizedLots = capped;
-   }
-
+   normalizedLots = lots;
    return true;
 }
+
 
 
 void ResetAdaptiveParamsToDefaults();
@@ -2109,7 +2178,7 @@ void OnTick()
    ulong tickStartMs = GetTickCount();
    datetime now = TimeCurrent();
    RefreshSymbolTradeConstraints();
-
+RefreshSymbolEconomics();
    static bool expiryWarned = false;
    bool expired = IsEAExpired();
    if(expired && !expiryWarned)
@@ -5338,13 +5407,7 @@ g_mtfReadFailureThisTick = false;
       double threatSoftFactor = MathMax(0.25, 1.0 - (over / 10.0) * 0.5);
       lotSize *= threatSoftFactor;
    }
-   if(INPUT_LOT_HIGH_ADX_BOOST_ON && INPUT_ENABLE_HIGH_ADX_RISK_MODE)
-   {
-      double adxNow[];
-      if(CopyBuffer(g_hADX_M1, 0, 0, 1, adxNow) == 1 && adxNow[0] >= INPUT_HIGH_ADX_THRESHOLD)
-         lotSize *= INPUT_HIGH_ADX_LOT_MULTIPLIER;
-   }
-
+ 
 if(INPUT_LOT_RISK_PARITY_CAP_ON && INPUT_ENABLE_RISK_PARITY_CAP)
    {
       int sess = GetCurrentSession();
@@ -6034,83 +6097,163 @@ int GetCurrentSession()
 //+------------------------------------------------------------------+
 double CalculateLotSize(double slPoints, double confidence, double threat, ENUM_RL_ACTION rlAction, int direction)
 {
-   if(slPoints <= 0) return 0;
+  if(!MathIsValidNumber(slPoints) || slPoints <= 0.0)
+      return 0.0;
 
-   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   double riskMoney = balance * (g_risk.riskPercent / 100.0);
-   if(!INPUT_LOT_BASE_RISK_ON)
-      riskMoney = balance * (INPUT_MIN_LOT_SIZE / MathMax(0.01, balance));
-
-   // Base lot size from risk (using OrderCalcProfit)
-   double slValue = slPoints * g_point;
-   double lotSize = 0;
-
-   double testProfit = 0;
-   double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   if(OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, 1.0, price, price + slValue, testProfit))
+    if(!MathIsValidNumber(g_tickValue) || g_tickValue <= 0.0 ||
+      !MathIsValidNumber(g_tickSize) || g_tickSize <= 0.0 ||
+      !MathIsValidNumber(g_point) || g_point <= 0.0)
    {
-      if(MathAbs(testProfit) > 0)
-         lotSize = riskMoney / MathAbs(testProfit);
+      RegisterDataWarning("CalculateLotSize invalid symbol economics");
+      return NormalizeVolumeToStep(g_minLot);
    }
 
-   // Fallback using tick value/size
-   if(!MathIsValidNumber(lotSize) || lotSize <= 0)
-      lotSize = riskMoney / (slPoints * (g_tickValue / g_tickSize) * g_point);
+   double pointValue = (g_tickValue / g_tickSize) * g_point;
+   if(!MathIsValidNumber(pointValue) || pointValue <= 0.0)
+   {
+      RegisterDataWarning("CalculateLotSize invalid point value");
+      return NormalizeVolumeToStep(g_minLot);
+   }
 
-   if(!MathIsValidNumber(lotSize) || lotSize <= 0)
-      return 0;
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(!MathIsValidNumber(equity) || equity <= 0.0)
+      return NormalizeVolumeToStep(g_minLot);
 
-   // Threat factor (never below 25%)
-   double threatFactor = 1.0 - (threat / 200.0);
-   threatFactor = MathMax(threatFactor, 0.25);
+   double riskMoney = equity * (g_risk.riskPercent / 100.0);
+   if(!INPUT_LOT_BASE_RISK_ON)
+            riskMoney = equity * (INPUT_MIN_LOT_SIZE / MathMax(0.01, equity));
+
+   double slValue = slPoints * g_point;
+ double price = (direction >= 0) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+      double baseLot = 0.0;
+   double testProfit = 0.0;
+   if(MathIsValidNumber(price) && price > 0.0 && OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, 1.0, price, price + slValue, testProfit))
+   {
+     if(MathIsValidNumber(testProfit) && MathAbs(testProfit) > 0.0)
+         baseLot = riskMoney / MathAbs(testProfit);
+   }
+
+if(!MathIsValidNumber(baseLot) || baseLot <= 0.0)
+      baseLot = riskMoney / MathMax(slPoints * pointValue, 1e-10);
+   if(!MathIsValidNumber(baseLot) || baseLot <= 0.0)
+      baseLot = g_minLot;
+
+double lotSize = baseLot;
+   double threatFactor = MathMax(0.25, MathMin(1.0, 1.0 - (threat / 200.0)));
+   double confFactor = MathMax(0.5, MathMin(1.0, 0.5 + (confidence / 200.0)));
    lotSize *= threatFactor;
 
-   // Confidence factor - less aggressive now (0.5?1.0 instead of 0?1)
-   double confFactor = 0.5 + (confidence / 200.0);
+  
    lotSize *= confFactor;
 
-   // RL scaling
+   double rlFactor = 1.0;
    if(INPUT_LOT_RL_SCALING_ON && INPUT_ENABLE_RL)
    {
       switch(rlAction)
       {
-         case RL_HALF_SIZE:    lotSize *= 0.5; break;
-         case RL_QUARTER_SIZE: lotSize *= 0.25; break;
-         case RL_SKIP_TRADE:   return 0; // Should never reach here
-         default: break;
+        case RL_HALF_SIZE:    rlFactor = 0.5; break;
+         case RL_QUARTER_SIZE: rlFactor = 0.25; break;
+         case RL_SKIP_TRADE:   return 0.0;
+         default: rlFactor = 1.0; break;
       }
    }
-
-   // Adaptive multiplier
+ rlFactor = MathMax(0.25, MathMin(1.0, rlFactor));
+   lotSize *= rlFactor;
+   
    if(INPUT_LOT_ADAPTIVE_MULTIPLIER_ON)
-      lotSize *= g_adaptive.lotMultiplier;
+      lotSize *= MathMax(0.25, MathMin(3.0, g_adaptive.lotMultiplier));
 
-   // Consecutive-win lot boost (optional)
+
+   
    if(INPUT_LOT_STREAK_BOOST_ON)
-      lotSize *= GetStreakLotMultiplier();
+  lotSize *= MathMax(0.25, MathMin(3.0, GetStreakLotMultiplier()));
 
-   // Round to lot step and clamp to limits
-   lotSize = MathFloor(lotSize / GetEffectiveLotStep()) * GetEffectiveLotStep();
+   if(INPUT_LOT_HIGH_ADX_BOOST_ON && INPUT_ENABLE_HIGH_ADX_RISK_MODE)
+   {
+      double adxNow[];
+      if(CopyBuffer(g_hADX_M1, 0, 0, 1, adxNow) == 1 && adxNow[0] >= INPUT_HIGH_ADX_THRESHOLD)
+         lotSize *= MathMax(0.25, MathMin(3.0, INPUT_HIGH_ADX_LOT_MULTIPLIER));
+   }
+
+
+  
    lotSize = MathMax(lotSize, g_risk.minLot);
    lotSize = MathMin(lotSize, g_risk.maxLot);
    lotSize = MathMax(lotSize, g_minLot);
    lotSize = MathMin(lotSize, g_maxLot);
 
-   // Check margin
-   double marginRequired = 0;
-   ENUM_ORDER_TYPE marginOrderType = (direction >= 0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
-   if(!OrderCalcMargin(marginOrderType, _Symbol, lotSize, price, marginRequired))
-      return 0;
+   string volReason = "";
+   double normalizedLot = 0.0;
+   if(!NormalizeAndValidateOrderVolume(lotSize, normalizedLot, volReason))
+      normalizedLot = NormalizeVolumeToStep(g_minLot);
+   lotSize = normalizedLot;
 
-   double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
-   if(INPUT_LOT_MARGIN_DOWNSCALE_ON && marginRequired > freeMargin * 0.8)
+   double marginRequired = 0.0;
+   ENUM_ORDER_TYPE marginOrderType = (direction >= 0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
+   if(!OrderCalcMargin(marginOrderType, _Symbol, lotSize, price, marginRequired) || !MathIsValidNumber(marginRequired) || marginRequired <= 0.0)
    {
-      lotSize = (freeMargin * 0.5) / (marginRequired / lotSize);
-      lotSize = MathFloor(lotSize / GetEffectiveLotStep()) * GetEffectiveLotStep();
-      if(lotSize < g_minLot) return 0;
+      RegisterDataWarning("CalculateLotSize margin pre-check failed");
+      return lotSize;
+   }
+   double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   if(INPUT_LOT_MARGIN_DOWNSCALE_ON && MathIsValidNumber(freeMargin) && freeMargin > 0.0 && marginRequired > freeMargin * 0.8)
+   {
+      double downscaledLot = lotSize * ((freeMargin * 0.8) / marginRequired);
+      string downscaleReason = "";
+      double validatedDownscaledLot = 0.0;
+      if(!NormalizeAndValidateOrderVolume(downscaledLot, validatedDownscaledLot, downscaleReason) || validatedDownscaledLot < g_minLot)
+      {
+         Print("LOT SIZE REJECTED: downscaled below tradable minimum",
+               " | baseLot=", DoubleToString(baseLot, g_lotDigits),
+               " | downscaledRequested=", DoubleToString(downscaledLot, g_lotDigits),
+               " | reason=", downscaleReason,
+               " | freeMargin=", DoubleToString(freeMargin, 2),
+               " | marginRequired=", DoubleToString(marginRequired, 2));
+         return 0.0;
+      }
+      lotSize = validatedDownscaledLot;
    }
 
-   return lotSize;
+   double effectiveRisk = slPoints * pointValue * lotSize;
+   if(INPUT_ENABLE_LOGGING)
+   {
+     Print("LOT CALC DIAGNOSTIC: baseLot=", DoubleToString(baseLot, g_lotDigits),
+            " | finalLot=", DoubleToString(lotSize, g_lotDigits),
+            " | riskMoney=", DoubleToString(riskMoney, 2),
+            " | effectiveRisk=", DoubleToString(effectiveRisk, 2),
+            " | slPoints=", DoubleToString(slPoints, 1),
+            " | threatFactor=", DoubleToString(threatFactor, 3),
+            " | confFactor=", DoubleToString(confFactor, 3),
+            " | rlFactor=", DoubleToString(rlFactor, 3));
+   }
+
+   
+   // ---- FINAL SAFETY CLAMP (FIX: prevent 0/NaN lot) ----
+   if(!MathIsValidNumber(lotSize) || lotSize <= 0.0)
+      lotSize = g_minLot;
+
+   // Respect broker + EA caps
+   double eaMin = (INPUT_MIN_LOT_SIZE > 0.0 ? INPUT_MIN_LOT_SIZE : g_minLot);
+   double eaMax = (INPUT_MAX_LOT_SIZE > 0.0 ? INPUT_MAX_LOT_SIZE : g_maxLot);
+
+   if(eaMin < g_minLot) eaMin = g_minLot;
+   if(eaMax > g_maxLot) eaMax = g_maxLot;
+   if(eaMax < eaMin) eaMax = eaMin;
+
+   if(lotSize < eaMin) lotSize = eaMin;
+   if(lotSize > eaMax) lotSize = eaMax;
+
+   // Normalize to step
+   double step = GetEffectiveLotStep();
+   if(!MathIsValidNumber(step) || step <= 0.0) step = 0.01;
+
+   lotSize = MathFloor(lotSize / step) * step;
+   if(lotSize < eaMin) lotSize = eaMin;
+
+   lotSize = NormalizeDouble(lotSize, g_lotDigits);
+
+return lotSize;
 }
 //+------------------------------------------------------------------+
 //| SECTION 22: ORDER EXECUTION                                      |
@@ -6355,7 +6498,7 @@ bool ExecuteOrder(const DecisionResult &decision)
    }
 
    int cooldownRemainingSec = 0;
-    bool cooldownActive = IsOrderCooldownActive(cooldownRemainingSec);
+   bool cooldownActive = IsOrderCooldownActive(cooldownRemainingSec);
    bool allowFlipCooldownBypass = (g_currentEntryIsFlip && INPUT_FLIP_BYPASS_COOLDOWN_ON);
    if(cooldownActive && !allowFlipCooldownBypass)
    {
@@ -6363,17 +6506,12 @@ bool ExecuteOrder(const DecisionResult &decision)
       g_gateDiagnostics.cooldownRejects++;
       return false;
    }
- if(cooldownActive && allowFlipCooldownBypass && !g_flipCooldownBypassLogged)
+   if(cooldownActive && allowFlipCooldownBypass && !g_flipCooldownBypassLogged)
    {
       g_flipCooldownBypassLogged = true;
       Print("COOLDOWN BYPASS APPLIED: flip replacement entry allowed | remaining=", cooldownRemainingSec, "s");
    }
-   string riskReject = "";
-   if(!CheckTotalRiskBudgetForCandidate(decision.direction, decision.lotSize, decision.slPoints, riskReject))
-   {
-      Print("ORDER REJECTED: ", riskReject);
-      return false;
-   }
+  
    double price, sl, tp;
    ENUM_ORDER_TYPE orderType;
 
@@ -6396,12 +6534,47 @@ bool ExecuteOrder(const DecisionResult &decision)
    tp = NormalizeDouble(tp, g_digits);
    price = NormalizeDouble(price, g_digits);
 
-// Trailing-TP primary mode: open trades without static TP and let ManageTrailingTP() drive TP updates.
    if(IsTpModifyEnabled() && INPUT_MODIFY_TRAILING_TP_ON && g_effModifyTrailingTP)
       tp = 0.0;
+string riskReject = "";
+   if(!CheckTotalRiskBudgetForCandidate(decision.direction, decision.lotSize, decision.slPoints, riskReject))
+   {
+      Print("ORDER REJECTED: ", riskReject);
+      return false;
+   }
 
+   double validatedLot = 0.0;
+   string lotReason = "";
+   if(!NormalizeAndValidateOrderVolume(decision.lotSize, validatedLot, lotReason))
+   {
+      Print("ORDER REJECTED BEFORE SEND: volume validation failed",
+            " | requestedLot=", DoubleToString(decision.lotSize, g_lotDigits),
+            " | slPoints=", DoubleToString(decision.slPoints, 1),
+            " | confidence=", DoubleToString(decision.confidence, 1),
+            " | threat=", DoubleToString(decision.threatLevel, 1),
+            " | direction=", decision.direction,
+            " | reason=", lotReason);
+      return false;
+   }
+
+   bool lotChangedMaterially = (MathAbs(validatedLot - decision.lotSize) > (GetEffectiveLotStep() * 0.5));
+   if(lotChangedMaterially)
+   {
+      string recheckReason = "";
+      if(!CheckTotalRiskBudgetForCandidate(decision.direction, validatedLot, decision.slPoints, recheckReason))
+      {
+         Print("ORDER REJECTED: validated lot risk check failed",
+               " | requestedLot=", DoubleToString(decision.lotSize, g_lotDigits),
+               " | validatedLot=", DoubleToString(validatedLot, g_lotDigits),
+               " | reason=", recheckReason);
+         return false;
+      }
+   }
+
+   DecisionResult validatedDecision = decision;
+   validatedDecision.lotSize = validatedLot;
    string comment = BuildUniqueOrderComment(COMMENT_MAIN_PREFIX, decision.direction);
-    if(INPUT_EXECUTION_MODE == PENDING_STOP)
+   if(INPUT_EXECUTION_MODE == PENDING_STOP)
    {
       if(!IsFeatureEnabled("pending_orders"))
       {
@@ -6410,14 +6583,14 @@ bool ExecuteOrder(const DecisionResult &decision)
          return false;
       }
       ulong pendingOrderTicket = 0;
-      if(!PlacePendingStopOrder(decision, comment, pendingOrderTicket))
+  if(!PlacePendingStopOrder(validatedDecision, comment, pendingOrderTicket))
       {
          Print("PENDING STOP ORDER FAILED");
          return false;
       }
 
       Print("PENDING STOP ORDER PLACED: ", (decision.direction == 1 ? "BUY_STOP" : "SELL_STOP"),
-            " | Lot: ", decision.lotSize,
+                 " | Lot: ", validatedLot,
             " | BasePrice: ", price,
             " | Conf: ", DoubleToString(decision.confidence, 1), "%",
             " | Threat: ", DoubleToString(decision.threatLevel, 1),
@@ -6434,7 +6607,7 @@ bool ExecuteOrder(const DecisionResult &decision)
          RecordStateAction(state, decision.rlAction, pendingOrderTicket, 0,
                            (decision.direction == 1 ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) + INPUT_PENDING_STOP_OFFSET_POINTS * g_point
                                                     : SymbolInfoDouble(_Symbol, SYMBOL_BID) - INPUT_PENDING_STOP_OFFSET_POINTS * g_point),
-                           decision.slPoints * g_point, decision.lotSize,
+                          decision.slPoints * g_point, validatedLot,
                            SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE),
                            decision.confidence, decision.mtfScore,
                            GetCombinationStrengthSnapshot(decision.signalCombination));
@@ -6443,7 +6616,7 @@ bool ExecuteOrder(const DecisionResult &decision)
       ConsumeStreakMultiplierOrder();
       datetime orderPlacedTime = TimeCurrent();
       g_daily.pendingOrdersPlaced++;
-       g_lastOrderTime = orderPlacedTime;
+        g_lastOrderTime = orderPlacedTime;
       if(decision.direction == 1)
          g_lastBuyOrderTime = orderPlacedTime;
       else
@@ -6458,25 +6631,11 @@ bool ExecuteOrder(const DecisionResult &decision)
          Print("EXECUTE ORDER SKIPPED: market path disabled by toggles");
       return false;
    }
-
-  int maxAttempts = INPUT_EXEC_MARKET_RETRY_ON ? 3 : 1;
-   double attemptLot = decision.lotSize;
-   string lotReason = "";
-   double validatedLot = 0.0;
-   if(!NormalizeAndValidateOrderVolume(attemptLot, validatedLot, lotReason))
-   {
-      Print("ORDER REJECTED BEFORE SEND: invalid initial lot | requested=", DoubleToString(attemptLot, g_lotDigits),
-            " | reason=", lotReason,
-            " | step=", DoubleToString(GetEffectiveLotStep(), g_lotDigits),
-            " | min=", DoubleToString(g_minLot, g_lotDigits),
-            " | max=", DoubleToString(g_maxLot, g_lotDigits));
-      return false;
-   }
-   attemptLot = validatedLot;
-
+ int maxAttempts = INPUT_EXEC_MARKET_RETRY_ON ? 3 : 1;
+   double attemptLot = validatedLot;
    for(int attempt = 0; attempt < maxAttempts; attempt++)
    {
-     g_trade.SetTypeFilling(g_selectedFillingMode);
+           g_trade.SetTypeFilling(g_selectedFillingMode);
       g_trade.SetExpertMagicNumber(BuildMagicForSubtype(SUBTYPE_MAIN));
 
       if(g_trade.PositionOpen(_Symbol, orderType, attemptLot, price, sl, tp, comment))
@@ -6500,13 +6659,10 @@ bool ExecuteOrder(const DecisionResult &decision)
                " | OrderTicket: ", orderTicket,
                " | PositionId: ", positionId);
 
-         // Track position in internal array
-            DecisionResult trackedDecision = decision;
+    DecisionResult trackedDecision = decision;
          trackedDecision.lotSize = attemptLot;
+TrackNewPosition(positionId, trackedDecision, comment);
 
-         // Track position in internal array
-   TrackNewPosition(positionId, trackedDecision, comment);
-         // Record RL state?action (if RL active)
          if(INPUT_ENABLE_RL && INPUT_EXEC_RECORD_RL_ON_SUBMIT && INPUT_RL_RECORD_ON)
          {
           int state = DetermineRLState(decision.confidence,
@@ -7144,11 +7300,20 @@ void MonitorRecoveryAveraging()
          }
 
          double recLots = g_positions[i].originalLots * lotRatio;
-          recLots = MathFloor(recLots / GetEffectiveLotStep()) * GetEffectiveLotStep();
-         recLots = MathMax(recLots, g_minLot);
-         recLots = MathMin(recLots, g_maxLot);
+ double validatedRecoveryLot = 0.0;
+         string recoveryReason = "";
+         if(!NormalizeAndValidateOrderVolume(recLots, validatedRecoveryLot, recoveryReason))
+         {
+            Print("RECOVERY ORDER ABORTED: invalid recovery lot",
+                  " | parentTicket=", ticket,
+                  " | originalLots=", DoubleToString(g_positions[i].originalLots, g_lotDigits),
+                  " | ratio=", DoubleToString(lotRatio, 4),
+                  " | requested=", DoubleToString(recLots, g_lotDigits),
+                  " | reason=", recoveryReason);
+            continue;
+         }
 
-         PlaceRecoveryOrder(ticket, posType, recLots, slPrice, entryPrice);
+                 PlaceRecoveryOrder(ticket, posType, validatedRecoveryLot, slPrice, entryPrice);
 
          g_positions[i].recoveryCount++;
          g_positions[i].lastRecoveryTime = TimeCurrent();
