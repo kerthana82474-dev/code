@@ -175,6 +175,12 @@ enum ENUM_TOGGLE_RESOLUTION_MODE
    TOGGLE_RESOLUTION_NEW_AUTH  = 1, // new is authoritative
    TOGGLE_RESOLUTION_STRICT_NEW = 2 // legacy mapping ignored + strict mismatch warnings
 };
+
+enum ENUM_TRAILING_TP_ACTIVATION_MODE
+{
+   TRAILING_TP_ACTIVATE_BY_POINTS = 0,
+   TRAILING_TP_ACTIVATE_BY_TP_PROGRESS = 1
+};
 input ENUM_TOGGLE_RESOLUTION_MODE INPUT_TOGGLE_RESOLUTION_MODE = TOGGLE_RESOLUTION_NEW_AUTH;
 input bool     INPUT_STRICT_EFFECTIVE_CONFIG_VALIDATION = false;
 //--- V7.31 Migration Notes (Toggle Semantics)
@@ -347,6 +353,8 @@ input bool     INPUT_ENABLE_TRAILING_TP_GAP = true;       // Enable trailing TP 
 input double   INPUT_TRAILING_TP_GAP_POINTS = 100.0;      // Gap between TP and current price (points)
 input double   INPUT_TRAILING_TP_STEP_POINTS = 50.0;      // Minimum movement step (points)
 input double   INPUT_TRAILING_TP_ACTIVATION_POINTS = 200.0; // Activate after this profit (points)
+input ENUM_TRAILING_TP_ACTIVATION_MODE INPUT_TRAILING_TP_ACTIVATION_MODE = TRAILING_TP_ACTIVATE_BY_POINTS; // Activate trailing TP by points or TP-progress
+input double   INPUT_TRAILING_TP_ACTIVATION_PERCENT = 50.0; // Activation threshold when mode=TP progress
 input group    "=== Money Management / Streak Multiplier ==="
 input bool     INPUT_ENABLE_STREAK_LOT_MULTIPLIER = true; // Enable temporary lot multiplier after win streak
 input int      INPUT_STREAK_TRIGGER_WINS = 2; // Consecutive wins needed to arm streak multiplier
@@ -1362,6 +1370,7 @@ bool ValidateInputsStrict(string &err)
    if(INPUT_TRAIL_ATR_MULTIPLIER <= 0.0) { err = "INPUT_TRAIL_ATR_MULTIPLIER must be > 0"; return false; }
    if(INPUT_TRAIL_STEP_POINTS <= 0.0) { err = "INPUT_TRAIL_STEP_POINTS must be > 0"; return false; }
    if(INPUT_TRAIL_ACTIVATION_POINTS < 0.0) { err = "INPUT_TRAIL_ACTIVATION_POINTS must be >= 0"; return false; }
+   if(INPUT_TRAILING_TP_ACTIVATION_PERCENT <= 0.0 || INPUT_TRAILING_TP_ACTIVATION_PERCENT > 100.0) { err = "INPUT_TRAILING_TP_ACTIVATION_PERCENT must be within (0,100]"; return false; }
    if(INPUT_EXECUTION_MODE == PENDING_STOP)
    {
       if(INPUT_PENDING_STOP_OFFSET_POINTS <= 0) { err = "INPUT_PENDING_STOP_OFFSET_POINTS must be > 0 when pending mode is enabled"; return false; }
@@ -1466,6 +1475,28 @@ void ValidatePartialCloseArrays()
       g_profitPartsCount = INPUT_PROFIT_PARTS_COUNT;
    }
    
+   // Compatibility: keep 50% TP partial close available even when custom profit parts are used
+   if(INPUT_ENABLE_50PCT_CLOSE && g_profitPartsCount > 0)
+   {
+      bool has50PctBand = false;
+      for(int i = 0; i < g_profitPartsCount; i++)
+      {
+         if(g_profitPartTriggers[i] >= INPUT_50PCT_TRIGGER_LOW && g_profitPartTriggers[i] <= INPUT_50PCT_TRIGGER_HIGH)
+         {
+            has50PctBand = true;
+            break;
+         }
+      }
+
+      if(!has50PctBand && g_profitPartsCount < 10)
+      {
+         double fallbackTrigger = (INPUT_50PCT_TRIGGER_LOW + INPUT_50PCT_TRIGGER_HIGH) * 0.5;
+         g_profitPartPercentages[g_profitPartsCount] = INPUT_PROFIT_CLOSE_PERCENT;
+         g_profitPartTriggers[g_profitPartsCount] = fallbackTrigger;
+         g_profitPartsCount++;
+         Print("INFO: Added fallback 50% TP partial level at ", DoubleToString(fallbackTrigger, 1), "% to keep 50pct close active with profit-parts mode.");
+      }
+   }
    // Log configuration
    Print("=== V7.33 PARTIAL CLOSE CONFIG ===");
    Print("Loss Parts: ", g_lossPartsCount);
@@ -9781,7 +9812,29 @@ void ManageTrailingTP()
      
 
       double profitPoints = dir * (current - entry) / _Point;
-      if(profitPoints < INPUT_TRAIL_ACTIVATION_POINTS)
+       bool activationReached = false;
+
+      if(INPUT_TRAILING_TP_ACTIVATION_MODE == TRAILING_TP_ACTIVATE_BY_TP_PROGRESS)
+      {
+         double tpDistancePoints = MathAbs(tp - entry) / _Point;
+         if(tp > 0.0 && tpDistancePoints > 0.0)
+         {
+            double progressPct = (profitPoints / tpDistancePoints) * 100.0;
+            if(progressPct >= INPUT_TRAILING_TP_ACTIVATION_PERCENT)
+               activationReached = true;
+         }
+         else if(profitPoints >= INPUT_TRAIL_ACTIVATION_POINTS)
+         {
+            activationReached = true; // Fallback when no static TP exists
+         }
+      }
+      else
+      {
+         if(profitPoints >= INPUT_TRAIL_ACTIVATION_POINTS)
+            activationReached = true;
+      }
+
+      if(!activationReached)
          continue;
 
       double newTP = current + dir * INPUT_TRAIL_STEP_POINTS * _Point;
