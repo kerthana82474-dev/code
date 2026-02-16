@@ -114,6 +114,9 @@ input bool     INPUT_FLIP_BYPASS_COOLDOWN_ON = true; // Confirmed opposite flip 
 input bool     INPUT_ALLOW_ADAPTIVE_MAX_POSITION_EXPANSION = false; // Allow adaptive max-position expansion above input cap when hard-cap is OFF
 input double   INPUT_FLIP_CLOSE_MAX_SL_PERCENT = 50.0; // Opposite close allowed only if adverse move is below this % of SL distance
 input bool     INPUT_FLIP_FORCE_CLOSE_OPPOSITE_MAIN = false; // Force-close opposite MAIN positions even when SL-loss threshold block would skip
+input bool     INPUT_FLIP_ZERO_TP_ON = true; // Flip TP reset mode: true=zero TP, false=reset to INPUT_FLIP_TP_RESET_PRICE
+input double   INPUT_FLIP_TP_RESET_PRICE = 0.0; // TP value used when INPUT_FLIP_ZERO_TP_ON=false (normalized to symbol digits)
+input bool     INPUT_FLIP_TP_RESET_CLAMP_ON = true; // If TP reset price violates stop distance: true=clamp outward, false=fallback to 0.0/
 //--- Risk Management
 input group    "=== Risk Management ==="
 input ENUM_RISK_PROFILE INPUT_RISK_PROFILE = RISK_MEDIUM; // Risk Profile
@@ -372,6 +375,7 @@ input double   INPUT_TRAILING_TP_STEP_POINTS = 50.0;      // Minimum movement st
 input double   INPUT_TRAILING_TP_ACTIVATION_PIPS = 20.0; // Activate after this profit (pips)
 input ENUM_TRAILING_TP_ACTIVATION_MODE INPUT_TRAILING_TP_ACTIVATION_MODE = TRAILING_TP_ACTIVATE_BY_PIPS; // Activate trailing TP by pips or TP-progress
 input double   INPUT_TRAILING_TP_ACTIVATION_PERCENT = 50.0; // Activation threshold when mode=TP progress
+input bool     INPUT_PROGRESS_MILESTONE_ZERO_TP_ON = true; // At milestone, zero TP before trailing TP mode (backward compatible default)
 input group    "=== Money Management / Streak Multiplier ==="
 input bool     INPUT_ENABLE_STREAK_LOT_MULTIPLIER = true; // Enable temporary lot multiplier after win streak
 input int      INPUT_STREAK_TRIGGER_WINS = 2; // Consecutive wins needed to arm streak multiplier
@@ -1866,6 +1870,22 @@ int OnInit()
                   g_point);
       return INIT_FAILED;
    }
+   
+   if(INPUT_ENABLE_LOGGING)
+   {
+      double practicalMinPoints = (double)MathMax(g_stopLevel, g_freezeLevel);
+      if(INPUT_TRAILING_TP_GAP_POINTS <= 0.0)
+         Print("WARNING: TRAILING_TP CONFIG: gap<=0 disables effective trailing movement | gapPts=", DoubleToString(INPUT_TRAILING_TP_GAP_POINTS, 1),
+               " | symbol=", _Symbol, " | stopLevelPts=", DoubleToString((double)g_stopLevel, 1), " | freezeLevelPts=", DoubleToString((double)g_freezeLevel, 1));
+      if(INPUT_TRAILING_TP_STEP_POINTS <= 0.0)
+         Print("WARNING: TRAILING_TP CONFIG: step<=0 may cause unstable trailing cadence | stepPts=", DoubleToString(INPUT_TRAILING_TP_STEP_POINTS, 1),
+               " | symbol=", _Symbol, " | stopLevelPts=", DoubleToString((double)g_stopLevel, 1), " | freezeLevelPts=", DoubleToString((double)g_freezeLevel, 1));
+      if(INPUT_TRAILING_TP_GAP_POINTS > 0.0 && practicalMinPoints > 0.0 && INPUT_TRAILING_TP_GAP_POINTS < practicalMinPoints)
+         Print("WARNING: TRAILING_TP CONFIG: gap below broker practical min (max(stop,freeze)) | gapPts=", DoubleToString(INPUT_TRAILING_TP_GAP_POINTS, 1),
+               " | practicalMinPts=", DoubleToString(practicalMinPoints, 1),
+               " | stopLevelPts=", DoubleToString((double)g_stopLevel, 1), " | freezeLevelPts=", DoubleToString((double)g_freezeLevel, 1),
+               " | symbol=", _Symbol);
+   }
 
    ValidatePartialCloseArrays();
    if(g_partialConfigInvalid)
@@ -2561,13 +2581,12 @@ void OnTick()
 }
 bool ZeroTPForMainPositionsOppositeToSignal(int direction)
 {
-   // V7.34 FIX: Removed blocking filters (ShouldSkipStopAdjustments, CanAttemptTPModify)
-   // Opposite signal override must zero TP unconditionally for cleanup to succeed.
+   // V7.35: flip TP reset is now configurable (zero TP or custom reset TP with broker-distance handling).
    bool allModified = true;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
-       if(ticket == 0 || !PositionSelectByTicket(ticket) || !IsOurMainPosition(ticket))
+      if(ticket == 0 || !PositionSelectByTicket(ticket) || !IsOurMainPosition(ticket))
          continue;
 
       int posType = (int)PositionGetInteger(POSITION_TYPE);
@@ -2575,29 +2594,87 @@ bool ZeroTPForMainPositionsOppositeToSignal(int direction)
       if(posDir == direction)
          continue;
 
+      string symbol = PositionGetString(POSITION_SYMBOL);
       double currentSL = PositionGetDouble(POSITION_SL);
       double previousTP = PositionGetDouble(POSITION_TP);
-      if(previousTP == 0.0)
+      double currentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
+      double minDist = (double)MathMax(g_stopLevel, g_freezeLevel) * g_point;
+      double targetTP = INPUT_FLIP_ZERO_TP_ON ? 0.0 : NormalizeDouble(INPUT_FLIP_TP_RESET_PRICE, g_digits);
+      string mode = INPUT_FLIP_ZERO_TP_ON ? "ZERO" : "RESET_PRICE";
+
+      if(!INPUT_FLIP_ZERO_TP_ON && targetTP != 0.0 && minDist > 0.0)
       {
-         Print("FLIP_TP_ZERO NOOP: ticket=", ticket, " | prevTP=0.0");
+         double distToCurrent = MathAbs(targetTP - currentPrice);
+         if(distToCurrent < minDist)
+         {
+            if(INPUT_FLIP_TP_RESET_CLAMP_ON)
+            {
+               targetTP = (posDir == 1) ? NormalizeDouble(currentPrice - minDist, g_digits)
+                                        : NormalizeDouble(currentPrice + minDist, g_digits);
+               if(INPUT_ENABLE_LOGGING)
+                  Print("FLIP_TP_RESET CLAMPED: ticket=", ticket,
+                        " | symbol=", symbol,
+                        " | dir=", (posDir == 1 ? "BUY" : "SELL"),
+                        " | mode=", mode,
+                        " | current=", DoubleToString(currentPrice, g_digits),
+                        " | prevTP=", DoubleToString(previousTP, g_digits),
+                        " | chosenTP=", DoubleToString(targetTP, g_digits),
+                        " | minDist=", DoubleToString(minDist, g_digits));
+            }
+            else
+            {
+               if(INPUT_ENABLE_LOGGING)
+                  Print("FLIP_TP_RESET TOO_CLOSE -> FALLBACK_ZERO: ticket=", ticket,
+                        " | symbol=", symbol,
+                        " | dir=", (posDir == 1 ? "BUY" : "SELL"),
+                        " | mode=", mode,
+                        " | requestedTP=", DoubleToString(INPUT_FLIP_TP_RESET_PRICE, g_digits),
+                        " | normalizedTP=", DoubleToString(targetTP, g_digits),
+                        " | current=", DoubleToString(currentPrice, g_digits),
+                        " | minDist=", DoubleToString(minDist, g_digits));
+               targetTP = 0.0;
+               mode = "FALLBACK_ZERO";
+            }
+         }
+      }
+
+      if(previousTP == targetTP)
+      {
+         if(INPUT_ENABLE_LOGGING)
+            Print("FLIP_TP_RESET NOOP: ticket=", ticket,
+                  " | symbol=", symbol,
+                  " | dir=", (posDir == 1 ? "BUY" : "SELL"),
+                  " | mode=", mode,
+                  " | prevTP=", DoubleToString(previousTP, g_digits),
+                  " | targetTP=", DoubleToString(targetTP, g_digits));
          continue;
       }
 
-      bool modified = g_trade.PositionModify(ticket, currentSL, 0.0);
+      bool modified = g_trade.PositionModify(ticket, currentSL, targetTP);
       if(modified)
       {
          ResetTPFailureTracker(ticket);
-         Print("FLIP_TP_ZERO OK: ticket=", ticket,
-               " | prevTP=", DoubleToString(previousTP, g_digits),
-               " | newTP=0.0 | FORCE_OVERRIDE=YES");
+         if(INPUT_ENABLE_LOGGING)
+            Print("FLIP_TP_RESET OK: ticket=", ticket,
+                  " | symbol=", symbol,
+                  " | dir=", (posDir == 1 ? "BUY" : "SELL"),
+                  " | mode=", mode,
+                  " | prevTP=", DoubleToString(previousTP, g_digits),
+                  " | newTP=", DoubleToString(targetTP, g_digits),
+                  " | FORCE_OVERRIDE=YES");
       }
       else
       {
          allModified = false;
-         Print("FLIP_TP_ZERO FAILED: ticket=", ticket,
-               " | prevTP=", DoubleToString(previousTP, g_digits),
-               " | retcode=", g_trade.ResultRetcode(),
-               " | comment=", g_trade.ResultComment());
+         if(INPUT_ENABLE_LOGGING)
+            Print("FLIP_TP_RESET FAILED: ticket=", ticket,
+                  " | symbol=", symbol,
+                  " | dir=", (posDir == 1 ? "BUY" : "SELL"),
+                  " | mode=", mode,
+                  " | prevTP=", DoubleToString(previousTP, g_digits),
+                  " | targetTP=", DoubleToString(targetTP, g_digits),
+                  " | retcode=", g_trade.ResultRetcode(),
+                  " | comment=", g_trade.ResultComment());
       }
    }
    return allModified;
@@ -7158,8 +7235,10 @@ void HandleProgressMilestoneActions(ulong ticket, int idx, double progressPct)
             g_positions[idx].movedToBreakeven = true;
       }
    }
-
-   if(g_effModifyTrailingTP && IsTpModifyEnabled() && INPUT_ENABLE_TRAILING_TP_GAP &&
+  bool milestoneTpZeroApplied = false;
+   bool milestoneTpZeroAttempted = false;
+   if(INPUT_PROGRESS_MILESTONE_ZERO_TP_ON &&
+      g_effModifyTrailingTP && IsTpModifyEnabled() && INPUT_ENABLE_TRAILING_TP_GAP &&
       CanModifyPosition(ticket) && CanAttemptTPModify(ticket) && !ShouldSkipStopAdjustmentsForTicket(ticket) &&
       PositionSelectByTicket(ticket))
    {
@@ -7167,22 +7246,26 @@ void HandleProgressMilestoneActions(ulong ticket, int idx, double progressPct)
       double previousTP = PositionGetDouble(POSITION_TP);
       if(previousTP != 0.0)
       {
+         milestoneTpZeroAttempted = true;
          bool modified = g_trade.PositionModify(ticket, currentSL, 0.0);
          if(modified)
          {
+            milestoneTpZeroApplied = true;
             ResetTPFailureTracker(ticket);
-            Print("PROGRESS_MILESTONE TP_ZERO OK: ticket=", ticket,
-                  " | progressPct=", DoubleToString(progressPct, 2),
-                  " | prevTP=", DoubleToString(previousTP, g_digits));
+            if(INPUT_ENABLE_LOGGING)
+               Print("PROGRESS_MILESTONE TP_ZERO OK: ticket=", ticket,
+                     " | progressPct=", DoubleToString(progressPct, 2),
+                     " | prevTP=", DoubleToString(previousTP, g_digits));
          }
          else
          {
             RegisterTPModifyFailure(ticket);
-            Print("PROGRESS_MILESTONE TP_ZERO FAILED: ticket=", ticket,
-                  " | progressPct=", DoubleToString(progressPct, 2),
-                  " | prevTP=", DoubleToString(previousTP, g_digits),
-                  " | retcode=", g_trade.ResultRetcode(),
-                  " | comment=", g_trade.ResultComment());
+            if(INPUT_ENABLE_LOGGING)
+               Print("PROGRESS_MILESTONE TP_ZERO FAILED: ticket=", ticket,
+                     " | progressPct=", DoubleToString(progressPct, 2),
+                     " | prevTP=", DoubleToString(previousTP, g_digits),
+                     " | retcode=", g_trade.ResultRetcode(),
+                     " | comment=", g_trade.ResultComment());
          }
       }
    }
@@ -7191,10 +7274,19 @@ void HandleProgressMilestoneActions(ulong ticket, int idx, double progressPct)
    {
       g_positions[idx].trailingTPActive = true;
       g_positions[idx].closePathState = CLOSE_PATH_TRAILING_TP_MODE;
-      Print("PROGRESS_MILESTONE TRAILING_MODE ENABLED: ticket=", ticket,
-            " | progressPct=", DoubleToString(progressPct, 2),
-            " | milestonePct=", DoubleToString(milestonePct, 2));
+      if(INPUT_ENABLE_LOGGING)
+         Print("PROGRESS_MILESTONE TRAILING_MODE ENABLED: ticket=", ticket,
+               " | progressPct=", DoubleToString(progressPct, 2),
+               " | milestonePct=", DoubleToString(milestonePct, 2));
    }
+
+   if(INPUT_ENABLE_LOGGING)
+      Print("PROGRESS_MILESTONE DIAG: ticket=", ticket,
+            " | milestoneReached=YES",
+            " | tpZeroConfig=", (INPUT_PROGRESS_MILESTONE_ZERO_TP_ON ? "ON" : "OFF"),
+            " | tpZeroApplied=", (milestoneTpZeroApplied ? "YES" : "NO"),
+            " | tpZeroAttempted=", (milestoneTpZeroAttempted ? "YES" : "NO"),
+            " | trailingActive=", (g_positions[idx].trailingTPActive ? "YES" : "NO"));
 }
 
 void ProcessProgressMilestoneActions()
@@ -10201,11 +10293,15 @@ void ManageTrailingTP()
       for(int j = 0; j < g_positionCount; j++) if(g_positions[j].isActive && g_positions[j].ticket == ticket) { idx = j; break; }
       if(idx < 0) continue;
 
+      string symbol = PositionGetString(POSITION_SYMBOL);
       ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
       int dir = (posType == POSITION_TYPE_BUY) ? 1 : -1;
-      
+
       double sl = PositionGetDouble(POSITION_SL);
       double current = PositionGetDouble(POSITION_PRICE_CURRENT);
+      double newSL = NormalizeDouble(current - dir * INPUT_TRAILING_TP_GAP_POINTS * _Point, g_digits);
+      double stepPrice = INPUT_TRAILING_TP_STEP_POINTS * _Point;
+      double minDist = g_stopLevel * g_point;
 
       // --- ACTIVATION CHECK (two modes: pips or % TP progress) ---
       if(!g_positions[idx].trailingTPActive)
@@ -10224,10 +10320,16 @@ void ManageTrailingTP()
             double activationPoints = INPUT_TRAILING_TP_ACTIVATION_PIPS * pipPoints;
             activateTrailingTP = (profitPoints >= activationPoints);
             if(!activateTrailingTP && INPUT_ENABLE_LOGGING && profitPoints > 0)
-               Print("TRAILING_TP CHECK: ticket=", ticket,
-                     " | mode=PIPS | profitPts=", DoubleToString(profitPoints, 1),
+               Print("TRAILING_TP SKIP: reason=activation_not_reached",
+                     " | ticket=", ticket,
+                     " | symbol=", symbol,
+                     " | dir=", (dir == 1 ? "BUY" : "SELL"),
+                     " | current=", DoubleToString(current, g_digits),
+                     " | sl=", DoubleToString(sl, g_digits),
+                     " | newSL=", DoubleToString(newSL, g_digits),
+                     " | profitPts=", DoubleToString(profitPoints, 1),
                      " | activationPts=", DoubleToString(activationPoints, 1),
-                     " | needMore=", DoubleToString(activationPoints - profitPoints, 1));
+                     " | stepPrice=", DoubleToString(stepPrice, g_digits));
          }
          else
          {
@@ -10240,10 +10342,16 @@ void ManageTrailingTP()
                   double progressPct = (profitPoints / tpDistancePoints) * 100.0;
                   activateTrailingTP = (progressPct >= INPUT_TRAILING_TP_ACTIVATION_PERCENT);
                   if(!activateTrailingTP && INPUT_ENABLE_LOGGING && profitPoints > 0)
-                     Print("TRAILING_TP CHECK: ticket=", ticket,
-                           " | mode=TP_PROGRESS | progressPct=", DoubleToString(progressPct, 1),
-                           " | threshold=", DoubleToString(INPUT_TRAILING_TP_ACTIVATION_PERCENT, 1),
-                           " | tpDist=", DoubleToString(tpDistancePoints, 1));
+                     Print("TRAILING_TP SKIP: reason=activation_not_reached",
+                           " | ticket=", ticket,
+                           " | symbol=", symbol,
+                           " | dir=", (dir == 1 ? "BUY" : "SELL"),
+                           " | current=", DoubleToString(current, g_digits),
+                           " | sl=", DoubleToString(sl, g_digits),
+                           " | newSL=", DoubleToString(newSL, g_digits),
+                           " | progressPct=", DoubleToString(progressPct, 1),
+                           " | thresholdPct=", DoubleToString(INPUT_TRAILING_TP_ACTIVATION_PERCENT, 1),
+                           " | tpDistPts=", DoubleToString(tpDistancePoints, 1));
                }
             }
             else if(INPUT_ENABLE_LOGGING)
@@ -10258,31 +10366,70 @@ void ManageTrailingTP()
 
          g_positions[idx].trailingTPActive = true;
          g_positions[idx].closePathState = CLOSE_PATH_TRAILING_TP_MODE;
-         Print("TRAILING_TP ACTIVATED: ticket=", ticket,
-               " | mode=", (INPUT_TRAILING_TP_ACTIVATION_MODE == TRAILING_TP_ACTIVATE_BY_PIPS ? "PIPS" : "TP_PROGRESS_PERCENT"),
-               " | profitPoints=", DoubleToString(profitPoints, 1));
+         if(INPUT_ENABLE_LOGGING)
+            Print("TRAILING_TP ACTIVATED: ticket=", ticket,
+                  " | symbol=", symbol,
+                  " | dir=", (dir == 1 ? "BUY" : "SELL"),
+                  " | mode=", (INPUT_TRAILING_TP_ACTIVATION_MODE == TRAILING_TP_ACTIVATE_BY_PIPS ? "PIPS" : "TP_PROGRESS_PERCENT"));
       }
 
       // --- TRAILING LOGIC: Move SL behind price with gap, zero out TP ---
-      double newSL = NormalizeDouble(current - dir * INPUT_TRAILING_TP_GAP_POINTS * _Point, g_digits);
-      double stepPrice = INPUT_TRAILING_TP_STEP_POINTS * _Point;
       if(g_positions[idx].lastTrailingTPPrice > 0.0)
       {
          double advance = (dir == 1) ? (newSL - g_positions[idx].lastTrailingTPPrice)
                                      : (g_positions[idx].lastTrailingTPPrice - newSL);
          if(advance < stepPrice)
+         {
+            if(INPUT_ENABLE_LOGGING)
+               Print("TRAILING_TP SKIP: reason=step_not_reached",
+                     " | ticket=", ticket,
+                     " | symbol=", symbol,
+                     " | dir=", (dir == 1 ? "BUY" : "SELL"),
+                     " | current=", DoubleToString(current, g_digits),
+                     " | sl=", DoubleToString(sl, g_digits),
+                     " | newSL=", DoubleToString(newSL, g_digits),
+                     " | lastTrail=", DoubleToString(g_positions[idx].lastTrailingTPPrice, g_digits),
+                     " | advance=", DoubleToString(advance, g_digits),
+                     " | stepPrice=", DoubleToString(stepPrice, g_digits));
             continue;
+         }
       }
 
       // V7.34 FIX: Only move SL in the favorable direction
       bool shouldMove = (dir == 1) ? (newSL > sl) : (newSL < sl);
-      if(!shouldMove) continue;
+      if(!shouldMove)
+      {
+         if(INPUT_ENABLE_LOGGING)
+            Print("TRAILING_TP SKIP: reason=not_favorable_direction",
+                  " | ticket=", ticket,
+                  " | symbol=", symbol,
+                  " | dir=", (dir == 1 ? "BUY" : "SELL"),
+                  " | current=", DoubleToString(current, g_digits),
+                  " | sl=", DoubleToString(sl, g_digits),
+                  " | newSL=", DoubleToString(newSL, g_digits),
+                  " | shouldMove=false");
+         continue;
+      }
 
-      double minDist = g_stopLevel * g_point;
+      bool brokerGuardBlocked = false;
       if(INPUT_MODIFY_BROKER_DISTANCE_GUARD_ON && dir == 1 && (current - newSL) < minDist)
-         continue;
+         brokerGuardBlocked = true;
       if(INPUT_MODIFY_BROKER_DISTANCE_GUARD_ON && dir == -1 && (newSL - current) < minDist)
+         brokerGuardBlocked = true;
+      if(brokerGuardBlocked)
+      {
+         if(INPUT_ENABLE_LOGGING)
+            Print("TRAILING_TP SKIP: reason=broker_distance_guard",
+                  " | ticket=", ticket,
+                  " | symbol=", symbol,
+                  " | dir=", (dir == 1 ? "BUY" : "SELL"),
+                  " | current=", DoubleToString(current, g_digits),
+                  " | sl=", DoubleToString(sl, g_digits),
+                  " | newSL=", DoubleToString(newSL, g_digits),
+                  " | minDist=", DoubleToString(minDist, g_digits),
+                  " | stopLevelPts=", DoubleToString((double)g_stopLevel, 1));
          continue;
+      }
 
       if(g_trade.PositionModify(ticket, newSL, 0.0))
       {
@@ -10291,19 +10438,29 @@ void ManageTrailingTP()
          MarkTicketManagedThisTick(ticket);
          if(INPUT_ENABLE_LOGGING)
             Print("TRAILING_TP MOVED: ticket=", ticket,
-                  " | newSL=", DoubleToString(newSL, g_digits),
+                  " | symbol=", symbol,
+                  " | dir=", (dir == 1 ? "BUY" : "SELL"),
+                  " | current=", DoubleToString(current, g_digits),
                   " | prevSL=", DoubleToString(sl, g_digits),
-                  " | gap=", DoubleToString(INPUT_TRAILING_TP_GAP_POINTS, 1), " pts");
+                  " | newSL=", DoubleToString(newSL, g_digits),
+                  " | gapPts=", DoubleToString(INPUT_TRAILING_TP_GAP_POINTS, 1),
+                  " | stepPts=", DoubleToString(INPUT_TRAILING_TP_STEP_POINTS, 1));
       }
-      else
+      else if(INPUT_ENABLE_LOGGING)
       {
          // V7.34 FIX: Log failure but don't use exponential backoff for trailing TP
          Print("TRAILING_TP MODIFY FAILED: ticket=", ticket,
+               " | symbol=", symbol,
+               " | dir=", (dir == 1 ? "BUY" : "SELL"),
+               " | current=", DoubleToString(current, g_digits),
+               " | sl=", DoubleToString(sl, g_digits),
+               " | newSL=", DoubleToString(newSL, g_digits),
                " | retcode=", g_trade.ResultRetcode(),
                " | comment=", g_trade.ResultComment());
       }
    }
 }
+
 
 //+------------------------------------------------------------------+
 //| V7.6 FIX: Multi-Level Partial Close (Missing Feature 12)        |
