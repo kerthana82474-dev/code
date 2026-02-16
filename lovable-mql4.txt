@@ -1,4 +1,4 @@
-//+------------------------------------------------------------------+ 
+//+------------------------------------------------------------------+
 //+------------------------------------------------------------------+
 //|                        XAUUSD_Adaptive_MDAE_EA.mq4               |
 //|       Production-Grade Adaptive MDAE Expert Advisor for MT4      |
@@ -178,6 +178,7 @@ extern int    InpMinBarsBeforeBE           = 3;
 // --- Trailing Parameters ---
 extern double InpATRTrailMultiplier        = 2.0;
 extern int    InpSwingLookback             = 10;
+extern int    InpTrailingStructureLookback = 10;
 extern double InpFastBankTriggerR          = 0.5;
 extern double InpFastBankTrailPoints       = 30.0;
 //+------------------------------------------------------------------+
@@ -315,7 +316,7 @@ int start()
    // 2) On new bar, evaluate entries
    if(NewBar())
    {
-      if(EnableEntries && g_msActive == 0)
+      if(EnableEntries)
          EvaluateEntry();
    }
    return(0);
@@ -361,7 +362,7 @@ double NormLot(double lots)
 //+------------------------------------------------------------------+
 //| HELPER — Current Spread                                          |
 //+------------------------------------------------------------------+
-double CurrentSpreadPoints()
+double EstimateSpreadPoints()
 {
    return((double)MarketInfo(InpSymbolName, MODE_SPREAD));
 }
@@ -405,38 +406,46 @@ int CountClosedOrders()
 void CheckForClosedTrades()
 {
    int currentClosedCount = CountClosedOrders();
-   if(currentClosedCount <= g_previousClosedCount) return;
-   // Process new closed orders
-   for(int i = OrdersHistoryTotal()-1; i >= 0; i--)
-   {
-      if(!OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) continue;
-      if(OrderSymbol() != InpSymbolName) continue;
-      if(OrderMagicNumber() != InpMagicNumber) continue;
-      // Check if this is a full close of our managed position
-      if(g_msActive == 1 && OrderTicket() == g_msTicket)
-      {
-         double profit = OrderProfit() + OrderSwap() + OrderCommission();
-         if(profit < 0)
-         {
-            g_dailyLossCount++;
-            g_weeklyLossCount++;
-         }
-         LogTradeSummary("CLOSED", profit);
-         ResetManagedState();
-         break;
-      }
-   }
-   // Also check if our position still exists
+   int liveTicket = FindOurTicket();
+
    if(g_msActive == 1)
    {
-      int ticket = FindOurTicket();
-      if(ticket == 0)
+      if(liveTicket > 0)
       {
-         // Position no longer exists
-         LogTradeSummary("CLOSED_DETECTED", 0);
-         ResetManagedState();
+         if(currentClosedCount > g_previousClosedCount)
+         {
+            LogDecisionEvent("TRADE_EVENT", "PARTIAL_CLOSE_DETECTED historyDelta=" + IntegerToString(currentClosedCount - g_previousClosedCount), g_msCurrentR);
+         }
+         if(g_msTicket != liveTicket)
+         {
+            LogDecisionEvent("TRADE_EVENT", "ROLLOVER_TICKET old=" + IntegerToString(g_msTicket) + " new=" + IntegerToString(liveTicket), g_msCurrentR);
+            g_msTicket = liveTicket;
+         }
+         g_previousClosedCount = currentClosedCount;
+         return;
       }
+
+      double finalProfit = 0;
+      bool finalFound = false;
+      for(int i = OrdersHistoryTotal()-1; i >= 0; i--)
+      {
+         if(!OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) continue;
+         if(OrderSymbol() != InpSymbolName) continue;
+         if(OrderMagicNumber() != InpMagicNumber) continue;
+         finalProfit = OrderProfit() + OrderSwap() + OrderCommission();
+         finalFound = true;
+         break;
+      }
+      if(finalFound && finalProfit < 0)
+      {
+         g_dailyLossCount++;
+         g_weeklyLossCount++;
+      }
+      LogDecisionEvent("TRADE_EVENT", "FULL_CLOSE_DETECTED ticket=" + IntegerToString(g_msTicket), g_msCurrentR);
+      LogTradeSummary("CLOSED", finalProfit);
+      ResetManagedState();
    }
+
    g_previousClosedCount = currentClosedCount;
 }
 
@@ -473,12 +482,6 @@ bool PassVWAPBias(int side, string stage)
    bool pass = (side > 0) ? (px >= vwap) : (px <= vwap);
    LogDecisionEvent(stage, "VWAP " + (pass ? "PASS" : "FAIL") + " px=" + DoubleToString(px,Digits) + " vwap=" + DoubleToString(vwap,Digits), 0);
    return pass;
-}
-
-double EstimateEntrySlippagePoints()
-{
-   RefreshRates();
-   return MathAbs(MarketInfo(InpSymbolName, MODE_ASK) - MarketInfo(InpSymbolName, MODE_BID)) / MarketInfo(InpSymbolName, MODE_POINT);
 }
 
 //+------------------------------------------------------------------+
@@ -685,7 +688,22 @@ int DetectRegime()
    }
    double bbWidth = (bbUpper - bbLower) / bbMiddle;
    double adxSlope = adxVal - adxPrev;
-   bool trendSignal = (adxVal >= InpADXTrendThreshold && adxSlope > 0 && bbWidth >= InpBBWidthExpandThreshold);
+   double atrNow = iATR(InpSymbolName, InpExecTF, InpATRPeriod, 0);
+   double atrPercentile = 50.0;
+   if(atrNow > 0)
+   {
+      int histCount = 0;
+      int countBelow = 0;
+      for(int i = 0; i < 100; i++)
+      {
+         double atrVal = iATR(InpSymbolName, InpExecTF, InpATRPeriod, i);
+         if(atrVal <= 0) continue;
+         histCount++;
+         if(atrVal <= atrNow) countBelow++;
+      }
+      if(histCount > 0) atrPercentile = (double)countBelow / (double)histCount * 100.0;
+   }
+   bool trendSignal = (adxVal >= InpADXTrendThreshold && adxSlope > 0 && bbWidth >= InpBBWidthExpandThreshold && atrPercentile >= InpATRPercentileHigh);
    bool rangeSignal = (adxVal <= InpADXWeakThreshold && bbWidth <= InpBBWidthCompressThreshold);
    g_regimeConfidence = 0.0;
    if(trendSignal)
@@ -693,7 +711,7 @@ int DetectRegime()
       g_regimeConfidence = MathMin(1.0, (adxVal / 50.0) * (bbWidth / InpBBWidthExpandThreshold));
       g_regimeRejectReason = "";
       g_currentRegime = REGIME_TREND_EXPANSION;
-      LogDecisionEvent("REGIME", "TREND_EXPANSION ADX=" + DoubleToString(adxVal,1) + " BBW=" + DoubleToString(bbWidth,5), g_regimeConfidence);
+      LogDecisionEvent("REGIME", "TREND_EXPANSION ADX=" + DoubleToString(adxVal,1) + " BBW=" + DoubleToString(bbWidth,5) + " ATRPct=" + DoubleToString(atrPercentile,1), g_regimeConfidence);
       return(REGIME_TREND_EXPANSION);
    }
    else if(rangeSignal)
@@ -701,7 +719,7 @@ int DetectRegime()
       g_regimeConfidence = MathMin(1.0, (1.0 - adxVal / InpADXTrendThreshold) * (1.0 - bbWidth / InpBBWidthExpandThreshold));
       g_regimeRejectReason = "";
       g_currentRegime = REGIME_MEAN_REVERSION;
-      LogDecisionEvent("REGIME", "MEAN_REVERSION ADX=" + DoubleToString(adxVal,1) + " BBW=" + DoubleToString(bbWidth,5), g_regimeConfidence);
+      LogDecisionEvent("REGIME", "MEAN_REVERSION ADX=" + DoubleToString(adxVal,1) + " BBW=" + DoubleToString(bbWidth,5) + " ATRPct=" + DoubleToString(atrPercentile,1), g_regimeConfidence);
       return(REGIME_MEAN_REVERSION);
    }
    else
@@ -713,7 +731,7 @@ int DetectRegime()
       }
       g_regimeRejectReason = "UNCERTAIN";
       g_currentRegime = REGIME_NO_TRADE;
-      LogDecisionEvent("REGIME", "NO_TRADE ADX=" + DoubleToString(adxVal,1) + " BBW=" + DoubleToString(bbWidth,5), 0);
+      LogDecisionEvent("REGIME", "NO_TRADE ADX=" + DoubleToString(adxVal,1) + " BBW=" + DoubleToString(bbWidth,5) + " ATRPct=" + DoubleToString(atrPercentile,1), 0);
       return(REGIME_NO_TRADE);
    }
 }
@@ -852,31 +870,26 @@ void EvaluateEntry()
    }
    if(EnableSpreadEntryFilter)
    {
-      double spread = CurrentSpreadPoints();
+      double spread = EstimateSpreadPoints();
       if(spread > InpMaxSpreadPoints)
       {
          LogDecisionEvent("PRECHECK", "Spread too high: " + DoubleToString(spread,1), 0);
          return;
       }
    }
-   if(EnableSlippageEntryFilter)
+   LogDecisionEvent("PRECHECK", "Slippage precheck disabled (post-fill measurement only)", 0);
+   if(EnableOnePositionOnly)
    {
-      double projSlip = EstimateEntrySlippagePoints();
-      if(projSlip > InpMaxSlippagePoints)
+      LogDecisionEvent("PRECHECK", "One-position policy active", 0);
+      if(IsOurPositionOpen())
       {
-         LogDecisionEvent("PRECHECK", "Slippage filter blocked entry: projected=" + DoubleToString(projSlip,1), 0);
+         LogDecisionEvent("PRECHECK", "One-position policy active; existing position present", 0);
          return;
       }
-      LogDecisionEvent("PRECHECK", "Slippage filter PASS projected=" + DoubleToString(projSlip,1), 0);
    }
    else
    {
-      LogDecisionEvent("PRECHECK", "Slippage filter inactive", 0);
-   }
-   if(IsOurPositionOpen())
-   {
-      LogDecisionEvent("PRECHECK", "One-position policy active; existing position present", 0);
-      return;
+      LogDecisionEvent("PRECHECK", "One-position policy inactive; multi-entry allowed", 0);
    }
    int regime = DetectRegime();
    if(regime == REGIME_NO_TRADE) return;
@@ -943,17 +956,22 @@ void OpenTrade(int side, int regime)
       LogDecisionEvent("ORDER_SUBMIT", "Insufficient margin", 0);
       return;
    }
-   double spreadAtEntry = CurrentSpreadPoints();
+   double spreadAtEntry = EstimateSpreadPoints();
    string comment = "MDAE";
    if(regime == REGIME_TREND_EXPANSION) comment = "MDAE_TREND";
    else if(regime == REGIME_MEAN_REVERSION) comment = "MDAE_MR";
    int ticket = -1;
+   double requestPriceUsed = 0;
    for(int retry = 0; retry < InpMaxRetries; retry++)
    {
       RefreshRates();
       double price = (side == 1) ? MarketInfo(InpSymbolName, MODE_ASK) : MarketInfo(InpSymbolName, MODE_BID);
       ticket = OrderSend(InpSymbolName, orderType, lots, price, InpMaxSlippagePoints, sl, tp, comment, InpMagicNumber, 0, (side==1) ? clrGreen : clrRed);
-      if(ticket > 0) break;
+      if(ticket > 0)
+      {
+         requestPriceUsed = price;
+         break;
+      }
       int err = GetLastError();
       if(EnableDebugPrints) Print("DEBUG: OrderSend retry ", retry, " err=", err);
       if(err == ERR_REQUOTE || err == ERR_PRICE_CHANGED || err == ERR_OFF_QUOTES)
@@ -984,7 +1002,8 @@ void OpenTrade(int side, int regime)
          g_msEntryTime = TimeCurrent();
          g_msBarsInTrade = 0;
          g_msSpreadAtEntry = spreadAtEntry;
-         g_msSlippageAtEntry = 0;
+         double point = MarketInfo(InpSymbolName, MODE_POINT);
+         g_msSlippageAtEntry = (point > 0 && requestPriceUsed > 0) ? MathAbs(OrderOpenPrice() - requestPriceUsed) / point : 0;
          g_msComplianceViolations = 0;
          g_msStopDueSpread = 0;
          g_msStopDueSlippage = 0;
@@ -993,7 +1012,10 @@ void OpenTrade(int side, int regime)
             " lots=" + DoubleToString(lots,2) +
             " SL=" + DoubleToString(sl, (int)MarketInfo(InpSymbolName, MODE_DIGITS)) +
             " TP=" + DoubleToString(tp, (int)MarketInfo(InpSymbolName, MODE_DIGITS)) +
-            " spread=" + DoubleToString(spreadAtEntry,1), 0);
+            " spread=" + DoubleToString(spreadAtEntry,1) +
+            " slippage=" + DoubleToString(g_msSlippageAtEntry,1), 0);
+         LogDecisionEvent("ORDER_FILL", "POST_FILL_SLIPPAGE points=" + DoubleToString(g_msSlippageAtEntry,1) +
+            " requested=" + DoubleToString(requestPriceUsed,Digits) + " fill=" + DoubleToString(OrderOpenPrice(),Digits), 0);
       }
    }
    else
@@ -1293,6 +1315,7 @@ void ApplyTrailingLogic()
    double currentPrice = (g_msDirection == 1) ? bid : ask;
    double point = MarketInfo(InpSymbolName, MODE_POINT);
    int method = g_msActiveMethod;
+   int trailLookback = MathMax(2, InpTrailingStructureLookback);
    // ATR Trail
    if(method == CM_ATR && EnableATRTrail)
    {
@@ -1301,28 +1324,32 @@ void ApplyTrailingLogic()
       else                   trailSL = currentPrice + atr * InpATRTrailMultiplier;
       MoveSL(trailSL, "ATR_TRAIL");
    }
-   // Swing Trail
+   // Swing Trail (protective structural pivot)
    if(method == CM_SWING && EnableSwingTrail)
    {
       if(g_msDirection == 1)
       {
-         double recentSwingLow = iLow(InpSymbolName, InpExecTF, 1);
-         for(int i = 2; i <= MathMin(InpSwingLookback, 5); i++)
+         double pivotLow = iLow(InpSymbolName, InpExecTF, 1);
+         for(int i = 2; i <= trailLookback; i++)
          {
             double lo = iLow(InpSymbolName, InpExecTF, i);
-            if(lo > recentSwingLow) recentSwingLow = lo;
+            if(lo < pivotLow) pivotLow = lo;
          }
-         MoveSL(recentSwingLow - atr * 0.2, "SWING_TRAIL");
+         double targetSL = pivotLow - atr * 0.2;
+         LogDecisionEvent("MANAGEMENT", "SWING_TRAIL pivotLow=" + DoubleToString(pivotLow,Digits) + " targetSL=" + DoubleToString(targetSL,Digits), g_msCurrentR);
+         MoveSL(targetSL, "SWING_TRAIL");
       }
       else
       {
-         double recentSwingHigh = iHigh(InpSymbolName, InpExecTF, 1);
-         for(int i = 2; i <= MathMin(InpSwingLookback, 5); i++)
+         double pivotHigh = iHigh(InpSymbolName, InpExecTF, 1);
+         for(int i = 2; i <= trailLookback; i++)
          {
             double hi = iHigh(InpSymbolName, InpExecTF, i);
-            if(hi < recentSwingHigh) recentSwingHigh = hi;
+            if(hi > pivotHigh) pivotHigh = hi;
          }
-         MoveSL(recentSwingHigh + atr * 0.2, "SWING_TRAIL");
+         double targetSL = pivotHigh + atr * 0.2;
+         LogDecisionEvent("MANAGEMENT", "SWING_TRAIL pivotHigh=" + DoubleToString(pivotHigh,Digits) + " targetSL=" + DoubleToString(targetSL,Digits), g_msCurrentR);
+         MoveSL(targetSL, "SWING_TRAIL");
       }
    }
    // Fast Bank
@@ -1339,26 +1366,30 @@ void ApplyTrailingLogic()
       if(g_msDirection == 1)
       {
          double atrSL = currentPrice - atr * InpATRTrailMultiplier;
-         double recentLow = iLow(InpSymbolName, InpExecTF, 1);
-         for(int i = 2; i <= MathMin(InpSwingLookback, 5); i++)
+         double pivotLow = iLow(InpSymbolName, InpExecTF, 1);
+         for(int i = 2; i <= trailLookback; i++)
          {
             double lo = iLow(InpSymbolName, InpExecTF, i);
-            if(lo > recentLow) recentLow = lo;
+            if(lo < pivotLow) pivotLow = lo;
          }
-         double structSL = recentLow - atr * 0.2;
-         MoveSL(MathMax(atrSL, structSL), "HYBRID_TRAIL");
+         double structSL = pivotLow - atr * 0.2;
+         double finalSL = MathMax(atrSL, structSL);
+         LogDecisionEvent("MANAGEMENT", "HYBRID_TRAIL pivotLow=" + DoubleToString(pivotLow,Digits) + " atrSL=" + DoubleToString(atrSL,Digits) + " finalSL=" + DoubleToString(finalSL,Digits), g_msCurrentR);
+         MoveSL(finalSL, "HYBRID_TRAIL");
       }
       else
       {
          double atrSL = currentPrice + atr * InpATRTrailMultiplier;
-         double recentHigh = iHigh(InpSymbolName, InpExecTF, 1);
-         for(int i = 2; i <= MathMin(InpSwingLookback, 5); i++)
+         double pivotHigh = iHigh(InpSymbolName, InpExecTF, 1);
+         for(int i = 2; i <= trailLookback; i++)
          {
             double hi = iHigh(InpSymbolName, InpExecTF, i);
-            if(hi < recentHigh) recentHigh = hi;
+            if(hi > pivotHigh) pivotHigh = hi;
          }
-         double structSL = recentHigh + atr * 0.2;
-         MoveSL(MathMin(atrSL, structSL), "HYBRID_TRAIL");
+         double structSL = pivotHigh + atr * 0.2;
+         double finalSL = MathMin(atrSL, structSL);
+         LogDecisionEvent("MANAGEMENT", "HYBRID_TRAIL pivotHigh=" + DoubleToString(pivotHigh,Digits) + " atrSL=" + DoubleToString(atrSL,Digits) + " finalSL=" + DoubleToString(finalSL,Digits), g_msCurrentR);
+         MoveSL(finalSL, "HYBRID_TRAIL");
       }
    }
 }
@@ -1495,7 +1526,7 @@ void LogDecisionEvent(string eventType, string detail, double score)
 {
    if(!EnableLogging) return;
    string ts = TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS);
-   double spread = CurrentSpreadPoints();
+   double spread = EstimateSpreadPoints();
    if(g_logHandle != INVALID_HANDLE)
    {
       string regimeStr = "NO_TRADE";
@@ -1542,7 +1573,7 @@ void LogTradeSummary(string closeType, double profit)
          "EXIT_SUMMARY", "", IntegerToString(g_msDirection),
          DoubleToString(g_msCurrentR, 3), "",
          detail, closeType,
-         DoubleToString(CurrentSpreadPoints(), 1), "",
+         DoubleToString(EstimateSpreadPoints(), 1), "",
          "0",
          (g_msStopDueSpread == 1 ? "true" : "false"),
          (g_msStopDueSlippage == 1 ? "true" : "false"));
@@ -1550,4 +1581,4 @@ void LogTradeSummary(string closeType, double profit)
    Print("[TRADE_SUMMARY] ", detail);
 }
 
-//+------------------------------------------------------------------+    
+//+------------------------------------------------------------------+
