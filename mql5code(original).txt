@@ -113,6 +113,7 @@ input bool     INPUT_FLIP_CANCEL_OPPOSITE_PENDING_ON = true; // On opposite flip
 input bool     INPUT_FLIP_BYPASS_COOLDOWN_ON = true; // Confirmed opposite flip may bypass global cooldown for replacement entry
 input bool     INPUT_ALLOW_ADAPTIVE_MAX_POSITION_EXPANSION = false; // Allow adaptive max-position expansion above input cap when hard-cap is OFF
 input double   INPUT_FLIP_CLOSE_MAX_SL_PERCENT = 50.0; // Opposite close allowed only if adverse move is below this % of SL distance
+input bool     INPUT_FLIP_FORCE_CLOSE_OPPOSITE_MAIN = false; // Force-close opposite MAIN positions even when SL-loss threshold block would skip
 //--- Risk Management
 input group    "=== Risk Management ==="
 input ENUM_RISK_PROFILE INPUT_RISK_PROFILE = RISK_MEDIUM; // Risk Profile
@@ -179,7 +180,8 @@ enum ENUM_TOGGLE_RESOLUTION_MODE
 
 enum ENUM_TRAILING_TP_ACTIVATION_MODE
 {
-   TRAILING_TP_ACTIVATE_BY_POINTS = 0,
+
+     TRAILING_TP_ACTIVATE_BY_PIPS = 0,
    TRAILING_TP_ACTIVATE_BY_TP_PROGRESS = 1
 };
 enum ENUM_PARTIAL_CLOSE_BASIS
@@ -367,8 +369,8 @@ input group    "=== V7.33: Trailing TP Gap Feature ==="
 input bool     INPUT_ENABLE_TRAILING_TP_GAP = true;       // Enable trailing TP with gap
 input double   INPUT_TRAILING_TP_GAP_POINTS = 100.0;      // Gap between TP and current price (points)
 input double   INPUT_TRAILING_TP_STEP_POINTS = 50.0;      // Minimum movement step (points)
-input double   INPUT_TRAILING_TP_ACTIVATION_POINTS = 200.0; // Activate after this profit (points)
-input ENUM_TRAILING_TP_ACTIVATION_MODE INPUT_TRAILING_TP_ACTIVATION_MODE = TRAILING_TP_ACTIVATE_BY_POINTS; // Activate trailing TP by points or TP-progress
+input double   INPUT_TRAILING_TP_ACTIVATION_PIPS = 20.0; // Activate after this profit (pips)
+input ENUM_TRAILING_TP_ACTIVATION_MODE INPUT_TRAILING_TP_ACTIVATION_MODE = TRAILING_TP_ACTIVATE_BY_PIPS; // Activate trailing TP by pips or TP-progress
 input double   INPUT_TRAILING_TP_ACTIVATION_PERCENT = 50.0; // Activation threshold when mode=TP progress
 input group    "=== Money Management / Streak Multiplier ==="
 input bool     INPUT_ENABLE_STREAK_LOT_MULTIPLIER = true; // Enable temporary lot multiplier after win streak
@@ -1561,6 +1563,7 @@ bool ValidateInputsStrict(string &err)
    if(INPUT_TRAIL_ATR_MULTIPLIER <= 0.0) { err = "INPUT_TRAIL_ATR_MULTIPLIER must be > 0"; return false; }
    if(INPUT_TRAIL_STEP_POINTS <= 0.0) { err = "INPUT_TRAIL_STEP_POINTS must be > 0"; return false; }
    if(INPUT_TRAIL_ACTIVATION_POINTS < 0.0) { err = "INPUT_TRAIL_ACTIVATION_POINTS must be >= 0"; return false; }
+      if(INPUT_TRAILING_TP_ACTIVATION_PIPS < 0.0) { err = "INPUT_TRAILING_TP_ACTIVATION_PIPS must be >= 0"; return false; }
    if(INPUT_TRAILING_TP_ACTIVATION_PERCENT <= 0.0 || INPUT_TRAILING_TP_ACTIVATION_PERCENT > 100.0) { err = "INPUT_TRAILING_TP_ACTIVATION_PERCENT must be within (0,100]"; return false; }
    if(INPUT_EXECUTION_MODE == PENDING_STOP)
    {
@@ -2064,6 +2067,12 @@ int OnInit()
    LogToggleMatrix("ManageTrailingTP", INPUT_ENABLE_TRAILING_TP, INPUT_MODIFY_TRAILING_TP_ON, g_effModifyTrailingTP);
    Print("TOGGLE DECISION: ManageTrailingTP effective decided by ", srcTrailingTP, " toggle path.");
    LogToggleMatrix("MoveToBreakeven", INPUT_MOVE_BE_AFTER_PARTIAL, INPUT_MODIFY_BREAKEVEN_ON, g_effModifyMoveToBE);
+    Print("CHECKLIST TRAILING_TP_GATES: legacy.INPUT_MODIFY_TRAILING_TP_ON=", (INPUT_MODIFY_TRAILING_TP_ON ? "ON" : "OFF"),
+         " | new.INPUT_ENABLE_TRAILING_TP_GAP=", (INPUT_ENABLE_TRAILING_TP_GAP ? "ON" : "OFF"),
+         " | effective.g_effModifyTrailingTP=", (g_effModifyTrailingTP ? "ON" : "OFF"));
+   Print("TRAILING_TP ACTIVATION MODE: mode=", (INPUT_TRAILING_TP_ACTIVATION_MODE == TRAILING_TP_ACTIVATE_BY_PIPS ? "PIPS" : "TP_PROGRESS_PERCENT"),
+         " | threshold=", DoubleToString((INPUT_TRAILING_TP_ACTIVATION_MODE == TRAILING_TP_ACTIVATE_BY_PIPS) ? INPUT_TRAILING_TP_ACTIVATION_PIPS : INPUT_TRAILING_TP_ACTIVATION_PERCENT, 2),
+         (INPUT_TRAILING_TP_ACTIVATION_MODE == TRAILING_TP_ACTIVATE_BY_PIPS ? " pips" : "% TP progress"));
    Print("TOGGLE DECISION: MoveToBreakeven effective decided by ", srcMoveToBE, " toggle path.");
      LogToggleMatrix("ShouldSkipStopAdjustmentsForTicket", INPUT_KEEP_LOSS_STOPS_ON_HIGH_SPREAD, INPUT_ENABLE_MODIFY_SKIP_LOSS_ON_HIGH_SPREAD, g_effModifySkipLossOnHighSpread);
 
@@ -2081,8 +2090,10 @@ int OnInit()
       if(legacyOverrideFound)
          Print("WARNING: Legacy mapping override active (legacy=true + new=false found). Consider TOGGLE_RESOLUTION_NEW_AUTH.");
    }
+      if(INPUT_ENABLE_TRAILING_TP && !INPUT_MODIFY_TRAILING_TP_ON)
+      Print("WARNING: TrailingTP toggle mismatch detected (legacy INPUT_ENABLE_TRAILING_TP=ON while new INPUT_MODIFY_TRAILING_TP_ON=OFF). Effective behavior depends on INPUT_TOGGLE_RESOLUTION_MODE.");
 
-   if(!ValidateAndReportEffectiveConfig())
+if(!ValidateAndReportEffectiveConfig())
       return INIT_FAILED;
 
    Print("CHECKLIST GUARD UpdateEAState=", (g_effExtremeByThreat || g_effExtremeByDrawdown || g_effDrawdownProtectState ? "ON" : "OFF"));
@@ -2473,42 +2484,36 @@ void OnTick()
          if(RunDecisionPipeline(decision) && decision.shouldTrade)
          {
             bool canExecuteOrder = true;
-            bool hasOppositeOpen = false;
-            bool hasOppositePending = false;
+            int oppositeOpenCount = 0;
+            int oppositePendingCount = 0;
 
             for(int i = PositionsTotal() - 1; i >= 0; i--)
             {
                ulong posTicket = PositionGetTicket(i);
-               if(posTicket == 0 || !PositionSelectByTicket(posTicket) || !IsOurPosition(posTicket))
-                  continue;
-               string posComment = PositionGetString(POSITION_COMMENT);
-               if(StringFind(posComment, COMMENT_MAIN_PREFIX) < 0 || !IsMainEntryComment(posComment))
+                  if(posTicket == 0 || !PositionSelectByTicket(posTicket) || !IsOurMainPosition(posTicket))
                   continue;
                int posDir = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 1 : -1;
                if(posDir != decision.direction)
-               {
-                  hasOppositeOpen = true;
-                  break;
-               }
+                 oppositeOpenCount++;
             }
 
-            if(!hasOppositeOpen)
-            
-            {
-               int oppositePending = CountMainPendingStopsByDirection(decision.direction * -1);
-               hasOppositePending = (oppositePending > 0);
-            }
-            bool isFlipEvent = (hasOppositeOpen || hasOppositePending);
+ oppositePendingCount = CountMainPendingStopsByDirection(decision.direction * -1);
+            bool isFlipEvent = (oppositeOpenCount > 0 || oppositePendingCount > 0);
             if(INPUT_CLOSE_ON_OPPOSITE_SIGNAL)
             {
              if(!CleanupOppositeExposureForFlip(decision.direction))
                {
                   canExecuteOrder = false;
                   if(INPUT_ENABLE_LOGGING)
-                     LogWithRestartGuard("ENTRY BLOCKED: opposite position not closable (<50% SL rule not met)");
-         
+                    LogWithRestartGuard("ENTRY BLOCKED: opposite exposure cleanup failed (LOSS_THRESHOLD_BLOCK or close/cancel error)");
+               }
             }
-         }
+         Print("FLIP ENTRY DIAG: signalDir=", (decision.direction == 1 ? "BUY" : "SELL"),
+                  " | closeOnOpposite=", (INPUT_CLOSE_ON_OPPOSITE_SIGNAL ? "ON" : "OFF"),
+                  " | oppositeOpen=", oppositeOpenCount,
+                  " | oppositePending=", oppositePendingCount,
+                  " | flipCloseMaxSLPct=", DoubleToString(INPUT_FLIP_CLOSE_MAX_SL_PERCENT, 2),
+                  " | canExecuteOrder=", (canExecuteOrder ? "YES" : "NO"));
           g_currentEntryIsFlip = (INPUT_STRICT_OPPOSITE_FLIP_MODE && isFlipEvent);
             g_flipCooldownBypassLogged = false;
             if(INPUT_ENABLE_LOGGING)
@@ -2550,11 +2555,7 @@ bool ZeroTPForMainPositionsOppositeToSignal(int direction)
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
-      if(ticket == 0 || !PositionSelectByTicket(ticket) || !IsOurPosition(ticket))
-         continue;
-
-      string comment = PositionGetString(POSITION_COMMENT);
-      if(StringFind(comment, COMMENT_MAIN_PREFIX) < 0 || !IsMainEntryComment(comment))
+       if(ticket == 0 || !PositionSelectByTicket(ticket) || !IsOurMainPosition(ticket))
          continue;
 
       int posType = (int)PositionGetInteger(POSITION_TYPE);
@@ -2622,11 +2623,7 @@ bool CloseMainPositionsOppositeToSignal(int direction)
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
-      if(ticket == 0 || !PositionSelectByTicket(ticket) || !IsOurPosition(ticket))
-         continue;
-
-      string comment = PositionGetString(POSITION_COMMENT);
-      if(StringFind(comment, COMMENT_MAIN_PREFIX) < 0 || !IsMainEntryComment(comment))
+      if(ticket == 0 || !PositionSelectByTicket(ticket) || !IsOurMainPosition(ticket))
          continue;
 
       int posType = (int)PositionGetInteger(POSITION_TYPE);
@@ -2649,20 +2646,30 @@ bool CloseMainPositionsOppositeToSignal(int direction)
        Print("FLIP_CLEANUP DIAG: ticket=", ticket,
             " | lossPctToSL=", DoubleToString(lossPctToSL, 2),
             " | threshold=", DoubleToString(INPUT_FLIP_CLOSE_MAX_SL_PERCENT, 2));
-      if(lossPctToSL <= INPUT_FLIP_CLOSE_MAX_SL_PERCENT)
+        bool allowClose = (lossPctToSL <= INPUT_FLIP_CLOSE_MAX_SL_PERCENT) || INPUT_FLIP_FORCE_CLOSE_OPPOSITE_MAIN;
+      if(allowClose)
       {
-         if(!g_trade.PositionClose(ticket))
+        if(g_trade.PositionClose(ticket))
+         {
+            Print("FLIP_CLEANUP CLOSE OK: ticket=", ticket,
+                  " | lossPctToSL=", DoubleToString(lossPctToSL, 2),
+                  " | threshold=", DoubleToString(INPUT_FLIP_CLOSE_MAX_SL_PERCENT, 2),
+                  " | forceClose=", (INPUT_FLIP_FORCE_CLOSE_OPPOSITE_MAIN ? "ON" : "OFF"));
+         }
+         else
          {
             allClosed = false;
             Print("FLIP_CLEANUP CLOSE FAILED: ticket=", ticket,
                   " | lossPctToSL=", DoubleToString(lossPctToSL, 2),
-                  " | threshold=", DoubleToString(INPUT_FLIP_CLOSE_MAX_SL_PERCENT, 2));
+                    " | threshold=", DoubleToString(INPUT_FLIP_CLOSE_MAX_SL_PERCENT, 2),
+                  " | forceClose=", (INPUT_FLIP_FORCE_CLOSE_OPPOSITE_MAIN ? "ON" : "OFF"));
          }
       }
       else
       {
+       allClosed = false;
          Print("FLIP_CLEANUP SKIP: ticket=", ticket,
-              " | reason=LOSS_ABOVE_ALLOWED_SL_PERCENT",
+              " | reason=LOSS_THRESHOLD_BLOCK",
                " | lossPctToSL=", DoubleToString(lossPctToSL, 2),
                " | threshold=", DoubleToString(INPUT_FLIP_CLOSE_MAX_SL_PERCENT, 2));
       }
@@ -3082,6 +3089,18 @@ bool IsMainEntryComment(const string &comment)
    if(StringFind(comment, COMMENT_50PCT_PREFIX) >= 0) return false;
    return true;
 }
+bool IsOurMainPosition(ulong ticket)
+{
+   if(!IsOurPosition(ticket))
+      return false;
+
+   long magic = PositionGetInteger(POSITION_MAGIC);
+   if(IsAuxSubtypeByMagic(magic))
+      return false;
+
+   string comment = PositionGetString(POSITION_COMMENT);
+   return IsMainEntryComment(comment);
+}
 
 bool IsOurMainPendingStopOrder(ulong ticket)
 {
@@ -3191,18 +3210,7 @@ int CountMainPositionsFromBroker()
    {
       ulong ticket = PositionGetTicket(i);
       if(ticket == 0) continue;
-      if(!IsOurPosition(ticket)) continue;
-
-      long magic = PositionGetInteger(POSITION_MAGIC);
-      string comment = PositionGetString(POSITION_COMMENT);
-      bool auxByMagic = IsAuxSubtypeByMagic(magic);
-      bool auxByComment = (StringFind(comment, COMMENT_RECOVERY_PREFIX) >= 0 ||
-                           StringFind(comment, COMMENT_AVG_PREFIX)      >= 0 ||
-                           StringFind(comment, COMMENT_HEDGE_PREFIX)    >= 0 ||
-                           StringFind(comment, COMMENT_GRID_PREFIX)     >= 0 ||
-                           StringFind(comment, COMMENT_50PCT_PREFIX)    >= 0);
-      if(auxByMagic || auxByComment) continue;
-
+     if(!IsOurMainPosition(ticket)) continue;
       mainCount++;
    }
    return mainCount;
@@ -10215,8 +10223,39 @@ void ManageTrailingTP()
      
 
      if(!g_positions[idx].trailingTPActive)
-         continue;
+      {
+         double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+         double tp = PositionGetDouble(POSITION_TP);
+         double profitPoints = (dir == 1) ? ((current - entry) / _Point) : ((entry - current) / _Point);
+         if(profitPoints < 0.0)
+            profitPoints = 0.0;
 
+         bool activateTrailingTP = false;
+         if(INPUT_TRAILING_TP_ACTIVATION_MODE == TRAILING_TP_ACTIVATE_BY_PIPS)
+         {
+            double pipPoints = (_Digits == 3 || _Digits == 5) ? 10.0 : 1.0;
+            double activationPoints = INPUT_TRAILING_TP_ACTIVATION_PIPS * pipPoints;
+            activateTrailingTP = (profitPoints >= activationPoints);
+         }
+         else
+         {
+            double tpDistancePoints = MathAbs(tp - entry) / _Point;
+            if(tpDistancePoints > 0.0)
+            {
+               double progressPct = (profitPoints / tpDistancePoints) * 100.0;
+               activateTrailingTP = (progressPct >= INPUT_TRAILING_TP_ACTIVATION_PERCENT);
+            }
+         }
+
+         if(!activateTrailingTP)
+            continue;
+
+         g_positions[idx].trailingTPActive = true;
+         g_positions[idx].closePathState = CLOSE_PATH_TRAILING_TP_MODE;
+         Print("TRAILING_TP ACTIVATED: ticket=", ticket,
+               " | mode=", (INPUT_TRAILING_TP_ACTIVATION_MODE == TRAILING_TP_ACTIVATE_BY_PIPS ? "PIPS" : "TP_PROGRESS_PERCENT"),
+               " | profitPoints=", DoubleToString(profitPoints, 1));
+      }
   double newSL = NormalizeDouble(current - dir * INPUT_TRAILING_TP_GAP_POINTS * _Point, g_digits);
       double stepPrice = INPUT_TRAILING_TP_STEP_POINTS * _Point;
       if(g_positions[idx].lastTrailingTPPrice > 0.0)
