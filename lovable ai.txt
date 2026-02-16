@@ -1,0 +1,3124 @@
+//+------------------------------------------------------------------+
+//|                        XAUUSD_Adaptive_MDAE_EA.mq5               |
+//|       Production-Grade Adaptive MDAE Expert Advisor for MT5      |
+//|           Version 1.0 — Full Implementation, No Placeholders     |
+//+------------------------------------------------------------------+
+#property copyright "XAUUSD Adaptive MDAE"
+#property link      ""
+#property version   "1.00"
+#property strict
+#include <Trade\Trade.mqh>
+//+------------------------------------------------------------------+
+//| ENUMERATIONS                                                     |
+//+------------------------------------------------------------------+
+enum ENUM_REGIME
+{
+   REGIME_NO_TRADE       = 0,
+   REGIME_TREND_EXPANSION= 1,
+   REGIME_MEAN_REVERSION = 2
+};
+enum ENUM_CLOSE_METHOD
+{
+   CM_FIXED   = 0,
+   CM_ATR     = 1,
+   CM_SWING   = 2,
+   CM_FAST    = 3,
+   CM_EXIT    = 4,
+   CM_HYBRID  = 5
+};
+enum ENUM_RISK_STATE
+{
+   RISK_ALLOW  = 0,
+   RISK_REDUCE = 1,
+   RISK_BLOCK  = 2
+};
+//+------------------------------------------------------------------+
+//| INPUTS — MASTER TOGGLES                                          |
+//+------------------------------------------------------------------+
+input group "=== Master Toggles ==="
+input bool   EnableEA                     = true;
+input bool   EnableEntries                = true;
+input bool   EnablePositionManagement     = true;
+input bool   EnableLogging                = true;
+input bool   EnableDebugPrints            = false;
+//+------------------------------------------------------------------+
+//| INPUTS — REGIME / ENTRY TOGGLES                                  |
+//+------------------------------------------------------------------+
+input group "=== Regime & Entry Toggles ==="
+input bool   EnableRegimeEngine           = true;
+input bool   EnableTrendModule            = true;
+input bool   EnableMeanReversionModule    = true;
+input bool   EnableNoTradeState           = true;
+input bool   EnableMTFContextCheck        = true;
+input bool   EnableVWAPCheck              = false;   // fallback if unavailable
+input bool   EnableSessionFilter          = true;
+input bool   EnableNewsWindowBlock        = false;   // manual schedule
+//+------------------------------------------------------------------+
+//| INPUTS — RISK / EXECUTION TOGGLES                                |
+//+------------------------------------------------------------------+
+input group "=== Risk & Execution Toggles ==="
+input bool   EnableRiskGovernor           = true;
+input bool   EnableDailyDDLock            = true;
+input bool   EnableWeeklyDDLock           = true;
+input bool   EnableConsecutiveLossLock    = true;
+input bool   EnableSpreadEntryFilter      = true;
+input bool   EnableSlippageEntryFilter    = true;
+input bool   EnableOnePositionOnly        = true;
+input bool   EnableMaxTradesPerSession    = true;
+//+------------------------------------------------------------------+
+//| INPUTS — MDAE FEATURE TOGGLES                                    |
+//+------------------------------------------------------------------+
+input group "=== MDAE Feature Toggles ==="
+input bool   EnableMDAE                   = true;
+input bool   EnablePipsPerSecond          = true;
+input bool   EnableVolumePulse            = true;
+input bool   EnableBodyExpansion          = true;
+input bool   EnableTop2BreakoutCheck      = true;
+input bool   EnableLowVolumeBox           = true;
+input bool   EnableFibGuidance            = false;
+input bool   EnableEntropyScoring         = true;
+input bool   EnablePolicySwitching        = true;
+//+------------------------------------------------------------------+
+//| INPUTS — EXIT / ACTION TOGGLES                                   |
+//+------------------------------------------------------------------+
+input group "=== Exit & Action Toggles ==="
+input bool   EnablePartialClose           = true;
+input bool   EnableBreakEven              = true;
+input bool   EnableATRTrail               = true;
+input bool   EnableSwingTrail             = true;
+input bool   EnableFastBankMode           = true;
+input bool   EnableHybridCloseMode        = true;
+input bool   EnableInvalidationExit       = true;
+input bool   EnableTimeStop               = true;
+//+------------------------------------------------------------------+
+//| INPUTS — COMPLIANCE TOGGLES                                      |
+//+------------------------------------------------------------------+
+input group "=== Compliance Toggles ==="
+input bool   EnforceNoSpreadSlStopMoves   = true;   // MUST default ON
+input bool   EnforceNoSlippageStopMoves   = true;   // MUST default ON
+input bool   EnableComplianceAuditCounters= true;
+//+------------------------------------------------------------------+
+//| INPUTS — SYMBOL & CORE                                           |
+//+------------------------------------------------------------------+
+input group "=== Core Settings ==="
+input string InpSymbolName                = "XAUUSD";
+input long   InpMagicNumber               = 777555;
+input ENUM_TIMEFRAMES InpExecTF           = PERIOD_M1;
+input ENUM_TIMEFRAMES InpContextTF_M5     = PERIOD_M5;
+input ENUM_TIMEFRAMES InpContextTF_M15    = PERIOD_M15;
+//+------------------------------------------------------------------+
+//| INPUTS — RISK PARAMETERS                                         |
+//+------------------------------------------------------------------+
+input group "=== Risk Parameters ==="
+input double InpRiskPercent               = 0.5;    // % equity per trade
+input double InpMaxDailyDD                = 3.0;    // % daily drawdown lock
+input double InpMaxWeeklyDD               = 6.0;    // % weekly drawdown lock
+input int    InpMaxConsecLosses           = 4;
+input int    InpMaxTradesPerSession       = 5;
+input double InpMaxSpreadPoints           = 50.0;   // spread entry filter
+input int    InpMaxSlippagePoints         = 30;
+input int    InpMaxRetries                = 3;
+//+------------------------------------------------------------------+
+//| INPUTS — INDICATOR PERIODS                                       |
+//+------------------------------------------------------------------+
+input group "=== Indicator Periods ==="
+input int    InpATRPeriod                 = 14;
+input int    InpADXPeriod                 = 14;
+input int    InpRSIPeriod                 = 14;
+input int    InpEMAFast                   = 20;
+input int    InpEMASlow                   = 50;
+input int    InpBBPeriod                  = 20;
+input double InpBBDeviation              = 2.0;
+//+------------------------------------------------------------------+
+//| INPUTS — REGIME THRESHOLDS                                       |
+//+------------------------------------------------------------------+
+input group "=== Regime Thresholds ==="
+input double InpADXTrendThreshold         = 25.0;
+input double InpADXWeakThreshold          = 18.0;
+input double InpBBWidthExpandThreshold    = 0.003;
+input double InpBBWidthCompressThreshold  = 0.0015;
+input double InpATRPercentileHigh         = 70.0;
+input int    InpADXSlopeBars              = 3;
+//+------------------------------------------------------------------+
+//| INPUTS — ENTRY PARAMETERS                                        |
+//+------------------------------------------------------------------+
+input group "=== Entry Parameters ==="
+input double InpRSIOverbought             = 70.0;
+input double InpRSIOversold               = 30.0;
+input double InpMinSetupQuality           = 0.5;
+input double InpOverextensionATRMult      = 2.5;
+input double InpMinBodyRatio              = 0.4;
+input int    InpSessionStartHour          = 7;   // London start
+input int    InpSessionEndHour            = 20;  // NY close
+//+------------------------------------------------------------------+
+//| INPUTS — POSITION MANAGEMENT                                     |
+//+------------------------------------------------------------------+
+input group "=== Position Management ==="
+input double InpATRSLMultiplier           = 1.5;
+input double InpInitialTPMultR            = 2.0;
+input double InpBETriggerR                = 1.0;
+input double InpBEBufferPoints            = 10.0;
+input double InpPartial1Pct               = 30.0;  // % of original
+input double InpPartial1TriggerR          = 1.0;
+input double InpPartial2Pct               = 30.0;
+input double InpPartial2TriggerR          = 2.0;
+input int    InpMinBarsBeforeBE           = 3;
+//+------------------------------------------------------------------+
+//| INPUTS — TRAILING                                                |
+//+------------------------------------------------------------------+
+input group "=== Trailing Parameters ==="
+input double InpATRTrailMultiplier        = 2.0;
+input int    InpSwingLookback             = 10;
+input double InpFastBankTriggerR          = 0.5;
+input double InpFastBankTrailPoints       = 30.0;
+//+------------------------------------------------------------------+
+//| INPUTS — MDAE PARAMETERS                                         |
+//+------------------------------------------------------------------+
+input group "=== MDAE Parameters ==="
+input int    InpSpeedWindowShort          = 5;
+input int    InpSpeedWindowLong           = 20;
+input int    InpVolumeAvgPeriod           = 20;
+input double InpVolumePulseThreshold      = 1.5;
+input int    InpTop2Lookback              = 20;
+input int    InpLowVolBoxPeriod           = 10;
+input double InpLowVolBoxThreshold        = 0.5;
+input double InpFibLevel1                 = 1.272;
+input double InpFibLevel2                 = 1.618;
+input int    InpMaxPolicySwitches         = 2;
+input int    InpMaxTradeAgeBars           = 120;
+input double InpEntropyHighThreshold      = 0.7;
+input double InpContinuationThreshold     = 0.6;
+input double InpExhaustionThreshold       = 0.4;
+//+------------------------------------------------------------------+
+//| INPUTS — NEWS WINDOW                                             |
+//+------------------------------------------------------------------+
+input group "=== News Window ==="
+input int    InpNewsBlockStartHour        = 13;
+input int    InpNewsBlockStartMin         = 25;
+input int    InpNewsBlockEndHour          = 13;
+input int    InpNewsBlockEndMin           = 40;
+//+------------------------------------------------------------------+
+//| MANAGED STATE STRUCTURE                                          |
+//+------------------------------------------------------------------+
+struct ManagedState
+{
+   bool     active;
+   ulong    ticket;
+   int      direction;       // +1 buy, -1 sell
+   double   entryPrice;
+   double   initialSL;
+   double   initialTP;
+   double   initialVolume;
+   double   riskDistance;     // price distance
+   double   mfe;
+   double   mae;
+   double   currentR;
+   bool     beApplied;
+   bool     partial1Done;
+   bool     partial2Done;
+   ENUM_CLOSE_METHOD activeMethod;
+   int      policySwitchCount;
+   datetime entryTime;
+   int      entryBar;
+   int      barsInTrade;
+   double   lastSpreadAtEntry;
+   double   lastSlippageAtEntry;
+   // Compliance
+   int      complianceViolationCount;
+   bool     stopChangedDueSpread;
+   bool     stopChangedDueSlippage;
+};
+//+------------------------------------------------------------------+
+//| GLOBAL STATE                                                     |
+//+------------------------------------------------------------------+
+CTrade g_trade;
+// Indicator handles
+int g_hATR, g_hADX, g_hRSI, g_hEMAFast, g_hEMASlow, g_hBB;
+int g_hATR_M5, g_hEMAFast_M5, g_hEMASlow_M5;
+int g_hATR_M15, g_hEMAFast_M15, g_hEMASlow_M15;
+// Runtime state
+datetime g_lastBar = 0;
+double   g_startEquity = 0;
+double   g_weekStartEquity = 0;
+int      g_dailyLossCount = 0;
+int      g_weeklyLossCount = 0;
+int      g_dayStamp = 0;
+int      g_weekStamp = 0;
+int      g_sessionTradeCount = 0;
+int      g_sessionDayStamp = 0;
+// Managed trade state
+ManagedState g_ms;
+// Log file handle
+int g_logHandle = INVALID_HANDLE;
+// Compliance audit counters
+int g_complianceTotalChecks = 0;
+int g_complianceTotalViolations = 0;
+// Regime state
+ENUM_REGIME g_currentRegime = REGIME_NO_TRADE;
+double g_regimeConfidence = 0.0;
+string g_regimeRejectReason = "";
+//+------------------------------------------------------------------+
+//| INITIALIZATION                                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   if(!EnableEA)
+   {
+      Print("EA is disabled via EnableEA input.");
+      return INIT_SUCCEEDED;
+   }
+   // Setup trade object
+   g_trade.SetExpertMagicNumber(InpMagicNumber);
+   g_trade.SetDeviationInPoints(InpMaxSlippagePoints);
+   g_trade.SetTypeFilling(ORDER_FILLING_FOK);
+   // Create indicator handles — M1
+   g_hATR     = iATR(InpSymbolName, InpExecTF, InpATRPeriod);
+   g_hADX     = iADX(InpSymbolName, InpExecTF, InpADXPeriod);
+   g_hRSI     = iRSI(InpSymbolName, InpExecTF, InpRSIPeriod, PRICE_CLOSE);
+   g_hEMAFast = iMA(InpSymbolName, InpExecTF, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
+   g_hEMASlow = iMA(InpSymbolName, InpExecTF, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE);
+   g_hBB      = iBands(InpSymbolName, InpExecTF, InpBBPeriod, 0, InpBBDeviation, PRICE_CLOSE);
+   // Context TF handles — M5
+   g_hATR_M5     = iATR(InpSymbolName, InpContextTF_M5, InpATRPeriod);
+   g_hEMAFast_M5 = iMA(InpSymbolName, InpContextTF_M5, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
+   g_hEMASlow_M5 = iMA(InpSymbolName, InpContextTF_M5, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE);
+   // Context TF handles — M15
+   g_hATR_M15     = iATR(InpSymbolName, InpContextTF_M15, InpATRPeriod);
+   g_hEMAFast_M15 = iMA(InpSymbolName, InpContextTF_M15, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
+   g_hEMASlow_M15 = iMA(InpSymbolName, InpContextTF_M15, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE);
+   // Validate handles
+   if(g_hATR==INVALID_HANDLE || g_hADX==INVALID_HANDLE || g_hRSI==INVALID_HANDLE ||
+      g_hEMAFast==INVALID_HANDLE || g_hEMASlow==INVALID_HANDLE || g_hBB==INVALID_HANDLE ||
+      g_hATR_M5==INVALID_HANDLE || g_hEMAFast_M5==INVALID_HANDLE || g_hEMASlow_M5==INVALID_HANDLE ||
+      g_hATR_M15==INVALID_HANDLE || g_hEMAFast_M15==INVALID_HANDLE || g_hEMASlow_M15==INVALID_HANDLE)
+   {
+      Print("ERROR: Failed to create indicator handles!");
+      return INIT_FAILED;
+   }
+   // Initialize equity tracking
+   g_startEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   g_weekStartEquity = g_startEquity;
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   g_dayStamp = dt.day_of_year;
+   g_weekStamp = dt.day_of_year / 7;
+   g_sessionDayStamp = g_dayStamp;
+   // Reset managed state
+   ResetManagedState();
+   // Reconstruct state if position exists on restart
+   ReconstructOpenPosition();
+   // Open log file
+   if(EnableLogging)
+   {
+      string logName = InpSymbolName + "_MDAE_Log_" + IntegerToString(InpMagicNumber) + ".csv";
+      g_logHandle = FileOpen(logName, FILE_WRITE|FILE_CSV|FILE_ANSI, ',');
+      if(g_logHandle != INVALID_HANDLE)
+      {
+         FileWrite(g_logHandle, "Timestamp","Symbol","TradeID","Event","Regime","Side",
+                   "CurrentR","Method","Action","ReasonCode","Spread","Volume",
+                   "Entropy","StopDueSpread","StopDueSlippage");
+      }
+   }
+   Print("XAUUSD Adaptive MDAE EA initialized successfully.");
+   return INIT_SUCCEEDED;
+}
+//+------------------------------------------------------------------+
+//| DEINITIALIZATION                                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   // Release indicator handles
+   if(g_hATR!=INVALID_HANDLE)     IndicatorRelease(g_hATR);
+   if(g_hADX!=INVALID_HANDLE)     IndicatorRelease(g_hADX);
+   if(g_hRSI!=INVALID_HANDLE)     IndicatorRelease(g_hRSI);
+   if(g_hEMAFast!=INVALID_HANDLE) IndicatorRelease(g_hEMAFast);
+   if(g_hEMASlow!=INVALID_HANDLE) IndicatorRelease(g_hEMASlow);
+   if(g_hBB!=INVALID_HANDLE)      IndicatorRelease(g_hBB);
+   if(g_hATR_M5!=INVALID_HANDLE)     IndicatorRelease(g_hATR_M5);
+   if(g_hEMAFast_M5!=INVALID_HANDLE) IndicatorRelease(g_hEMAFast_M5);
+   if(g_hEMASlow_M5!=INVALID_HANDLE) IndicatorRelease(g_hEMASlow_M5);
+   if(g_hATR_M15!=INVALID_HANDLE)     IndicatorRelease(g_hATR_M15);
+   if(g_hEMAFast_M15!=INVALID_HANDLE) IndicatorRelease(g_hEMAFast_M15);
+   if(g_hEMASlow_M15!=INVALID_HANDLE) IndicatorRelease(g_hEMASlow_M15);
+   if(g_logHandle != INVALID_HANDLE)
+   {
+      FileClose(g_logHandle);
+      g_logHandle = INVALID_HANDLE;
+   }
+   Print("XAUUSD Adaptive MDAE EA deinitialized. Compliance violations: ", g_complianceTotalViolations);
+}
+//+------------------------------------------------------------------+
+//| ONTICK                                                           |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if(!EnableEA) return;
+   // Day/Week reset
+   CheckDayWeekReset();
+   // 1) Manage existing position first (every tick)
+   if(EnablePositionManagement && g_ms.active)
+      ManagePosition();
+   // 2) On new bar, evaluate entries
+   if(NewBar())
+   {
+      if(EnableEntries && !g_ms.active)
+         EvaluateEntry();
+   }
+}
+//+------------------------------------------------------------------+
+//| OnTradeTransaction                                               |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest &request,
+                        const MqlTradeResult &result)
+{
+   if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
+   {
+      if(trans.symbol != InpSymbolName) return;
+      ulong dealTicket = trans.deal;
+      if(dealTicket == 0) return;
+      if(HistoryDealSelect(dealTicket))
+      {
+         long dealMagic = HistoryDealGetInteger(dealTicket, DEAL_MAGIC);
+         if(dealMagic != InpMagicNumber) return;
+         ENUM_DEAL_ENTRY dealEntry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+         if(dealEntry == DEAL_ENTRY_OUT || dealEntry == DEAL_ENTRY_OUT_BY)
+         {
+            double profit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT) +
+                            HistoryDealGetDouble(dealTicket, DEAL_SWAP) +
+                            HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
+            if(profit < 0)
+            {
+               g_dailyLossCount++;
+               g_weeklyLossCount++;
+            }
+            // Check if position fully closed
+            if(g_ms.active)
+            {
+               double remainingVol = 0;
+               if(PositionSelectByTicket(g_ms.ticket))
+                  remainingVol = PositionGetDouble(POSITION_VOLUME);
+               else
+                  remainingVol = 0;
+               if(remainingVol <= 0.0)
+               {
+                  LogTradeSummary("CLOSED", profit);
+                  ResetManagedState();
+               }
+            }
+         }
+      }
+   }
+}
+//+------------------------------------------------------------------+
+//| HELPER — Safe Indicator Copy                                     |
+//+------------------------------------------------------------------+
+bool CopyBuf1(int handle, int bufIndex, int shift, double &val)
+{
+   double buf[1];
+   if(CopyBuffer(handle, bufIndex, shift, 1, buf) != 1)
+   {
+      val = 0;
+      return false;
+   }
+   val = buf[0];
+   return true;
+}
+bool CopyBufN(int handle, int bufIndex, int shift, int count, double &arr[])
+{
+   if(ArrayResize(arr, count) != count) return false;
+   if(CopyBuffer(handle, bufIndex, shift, count, arr) != count) return false;
+   return true;
+}
+//+------------------------------------------------------------------+
+//| HELPER — NewBar                                                  |
+//+------------------------------------------------------------------+
+bool NewBar()
+{
+   datetime t = iTime(InpSymbolName, InpExecTF, 0);
+   if(t == 0) return false;
+   if(t != g_lastBar)
+   {
+      g_lastBar = t;
+      return true;
+   }
+   return false;
+}
+//+------------------------------------------------------------------+
+//| HELPER — NormalizePrice                                          |
+//+------------------------------------------------------------------+
+double NormalizePrice(double price)
+{
+   double tickSize = SymbolInfoDouble(InpSymbolName, SYMBOL_TRADE_TICK_SIZE);
+   if(tickSize <= 0) tickSize = SymbolInfoDouble(InpSymbolName, SYMBOL_POINT);
+   if(tickSize <= 0) return NormalizeDouble(price, (int)SymbolInfoInteger(InpSymbolName, SYMBOL_DIGITS));
+   return NormalizeDouble(MathRound(price / tickSize) * tickSize, (int)SymbolInfoInteger(InpSymbolName, SYMBOL_DIGITS));
+}
+//+------------------------------------------------------------------+
+//| HELPER — NormalizeLot                                            |
+//+------------------------------------------------------------------+
+double NormalizeLot(double lots)
+{
+   double minLot  = SymbolInfoDouble(InpSymbolName, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(InpSymbolName, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(InpSymbolName, SYMBOL_VOLUME_STEP);
+   if(lotStep <= 0) lotStep = 0.01;
+   lots = MathFloor(lots / lotStep) * lotStep;
+   if(lots < minLot) lots = minLot;
+   if(lots > maxLot) lots = maxLot;
+   return NormalizeDouble(lots, 2);
+}
+//+------------------------------------------------------------------+
+//| HELPER — IsOurPosition                                           |
+//+------------------------------------------------------------------+
+bool IsOurPosition()
+{
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != InpSymbolName) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+      return true;
+   }
+   return false;
+}
+//+------------------------------------------------------------------+
+//| HELPER — Get Our Position Ticket                                 |
+//+------------------------------------------------------------------+
+ulong GetOurTicket()
+{
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != InpSymbolName) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+      return ticket;
+   }
+   return 0;
+}
+//+------------------------------------------------------------------+
+//| HELPER — Current Spread                                          |
+//+------------------------------------------------------------------+
+double CurrentSpreadPoints()
+{
+   return (double)SymbolInfoInteger(InpSymbolName, SYMBOL_SPREAD);
+}
+//+------------------------------------------------------------------+
+//| HELPER — Day/Week Reset                                          |
+//+------------------------------------------------------------------+
+void CheckDayWeekReset()
+{
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   int curDay = dt.day_of_year;
+   int curWeek = curDay / 7;
+   if(curDay != g_dayStamp)
+   {
+      g_dayStamp = curDay;
+      g_startEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      g_dailyLossCount = 0;
+   }
+   if(curDay != g_sessionDayStamp)
+   {
+      g_sessionDayStamp = curDay;
+      g_sessionTradeCount = 0;
+   }
+   if(curWeek != g_weekStamp)
+   {
+      g_weekStamp = curWeek;
+      g_weekStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      g_weeklyLossCount = 0;
+   }
+}
+//+------------------------------------------------------------------+
+//| HELPER — Reset Managed State                                     |
+//+------------------------------------------------------------------+
+void ResetManagedState()
+{
+   ZeroMemory(g_ms);
+   g_ms.active = false;
+   g_ms.activeMethod = CM_FIXED;
+}
+//+------------------------------------------------------------------+
+//| HELPER — Reconstruct Open Position on Restart                    |
+//+------------------------------------------------------------------+
+void ReconstructOpenPosition()
+{
+   ulong ticket = GetOurTicket();
+   if(ticket == 0) return;
+   if(!PositionSelectByTicket(ticket)) return;
+   g_ms.active        = true;
+   g_ms.ticket        = ticket;
+   g_ms.entryPrice    = PositionGetDouble(POSITION_PRICE_OPEN);
+   g_ms.initialSL     = PositionGetDouble(POSITION_SL);
+   g_ms.initialTP     = PositionGetDouble(POSITION_TP);
+   g_ms.initialVolume = PositionGetDouble(POSITION_VOLUME);
+   g_ms.entryTime     = (datetime)PositionGetInteger(POSITION_TIME);
+   ENUM_POSITION_TYPE ptype = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   g_ms.direction = (ptype == POSITION_TYPE_BUY) ? 1 : -1;
+   g_ms.riskDistance = MathAbs(g_ms.entryPrice - g_ms.initialSL);
+   if(g_ms.riskDistance <= 0)
+   {
+      double atr = 0;
+      CopyBuf1(g_hATR, 0, 1, atr);
+      g_ms.riskDistance = (atr > 0) ? atr * InpATRSLMultiplier : 100 * SymbolInfoDouble(InpSymbolName, SYMBOL_POINT);
+   }
+   g_ms.mfe = 0;
+   g_ms.mae = 0;
+   g_ms.beApplied = false;
+   g_ms.partial1Done = false;
+   g_ms.partial2Done = false;
+   g_ms.activeMethod = CM_FIXED;
+   g_ms.policySwitchCount = 0;
+   g_ms.entryBar = 0;
+   g_ms.barsInTrade = 0;
+   g_ms.complianceViolationCount = 0;
+   g_ms.stopChangedDueSpread = false;
+   g_ms.stopChangedDueSlippage = false;
+   Print("INFO: Reconstructed open position ticket=", ticket, " dir=", g_ms.direction, " entry=", g_ms.entryPrice);
+   LogDecisionEvent("RECONSTRUCTION", "Reconstructed existing position on restart", 0);
+}
+//+------------------------------------------------------------------+
+//| HELPER — Session Filter                                          |
+//+------------------------------------------------------------------+
+bool IsWithinSession()
+{
+   if(!EnableSessionFilter) return true;
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   int hour = dt.hour;
+   return (hour >= InpSessionStartHour && hour < InpSessionEndHour);
+}
+//+------------------------------------------------------------------+
+//| HELPER — News Window Block                                       |
+//+------------------------------------------------------------------+
+bool IsNewsBlocked()
+{
+   if(!EnableNewsWindowBlock) return false;
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   int nowMin = dt.hour * 60 + dt.min;
+   int startMin = InpNewsBlockStartHour * 60 + InpNewsBlockStartMin;
+   int endMin   = InpNewsBlockEndHour * 60 + InpNewsBlockEndMin;
+   return (nowMin >= startMin && nowMin <= endMin);
+}
+//+------------------------------------------------------------------+
+//| RISK GOVERNOR — IsTradingLocked                                  |
+//+------------------------------------------------------------------+
+ENUM_RISK_STATE RiskCheck()
+{
+   if(!EnableRiskGovernor) return RISK_ALLOW;
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   // Daily DD lock
+   if(EnableDailyDDLock && g_startEquity > 0)
+   {
+      double ddPct = ((g_startEquity - equity) / g_startEquity) * 100.0;
+      if(ddPct >= InpMaxDailyDD)
+      {
+         LogDecisionEvent("RISK_GOVERNOR", "Daily DD lock triggered: " + DoubleToString(ddPct,2) + "%", 0);
+         return RISK_BLOCK;
+      }
+   }
+   // Weekly DD lock
+   if(EnableWeeklyDDLock && g_weekStartEquity > 0)
+   {
+      double wddPct = ((g_weekStartEquity - equity) / g_weekStartEquity) * 100.0;
+      if(wddPct >= InpMaxWeeklyDD)
+      {
+         LogDecisionEvent("RISK_GOVERNOR", "Weekly DD lock triggered: " + DoubleToString(wddPct,2) + "%", 0);
+         return RISK_BLOCK;
+      }
+   }
+   // Consecutive loss lock
+   if(EnableConsecutiveLossLock && g_dailyLossCount >= InpMaxConsecLosses)
+   {
+      LogDecisionEvent("RISK_GOVERNOR", "Consecutive loss lock: " + IntegerToString(g_dailyLossCount), 0);
+      return RISK_BLOCK;
+   }
+   // Max trades per session
+   if(EnableMaxTradesPerSession && g_sessionTradeCount >= InpMaxTradesPerSession)
+   {
+      LogDecisionEvent("RISK_GOVERNOR", "Max session trades reached", 0);
+      return RISK_BLOCK;
+   }
+   // Reduce risk if approaching limits
+   if(EnableDailyDDLock && g_startEquity > 0)
+   {
+      double ddPct = ((g_startEquity - equity) / g_startEquity) * 100.0;
+      if(ddPct >= InpMaxDailyDD * 0.7)
+         return RISK_REDUCE;
+   }
+   return RISK_ALLOW;
+}
+bool IsTradingLocked()
+{
+   return (RiskCheck() == RISK_BLOCK);
+}
+//+------------------------------------------------------------------+
+//| RISK GOVERNOR — CalcLotSizeByRisk                                |
+//+------------------------------------------------------------------+
+double CalcLotSizeByRisk(double slDistancePrice)
+{
+   if(slDistancePrice <= 0) return SymbolInfoDouble(InpSymbolName, SYMBOL_VOLUME_MIN);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double riskPct = InpRiskPercent;
+   // Reduce if risk state is REDUCE
+   ENUM_RISK_STATE rs = RiskCheck();
+   if(rs == RISK_REDUCE) riskPct *= 0.5;
+   double riskMoney = equity * riskPct / 100.0;
+   double tickValue = SymbolInfoDouble(InpSymbolName, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(InpSymbolName, SYMBOL_TRADE_TICK_SIZE);
+   if(tickValue <= 0 || tickSize <= 0)
+      return SymbolInfoDouble(InpSymbolName, SYMBOL_VOLUME_MIN);
+   double slTicks = slDistancePrice / tickSize;
+   double lossPerLot = slTicks * tickValue;
+   if(lossPerLot <= 0) return SymbolInfoDouble(InpSymbolName, SYMBOL_VOLUME_MIN);
+   double lots = riskMoney / lossPerLot;
+   return NormalizeLot(lots);
+}
+//+------------------------------------------------------------------+
+//| REGIME ENGINE — DetectRegime                                     |
+//+------------------------------------------------------------------+
+ENUM_REGIME DetectRegime()
+{
+   if(!EnableRegimeEngine) return REGIME_TREND_EXPANSION; // default if disabled
+   double adxVal = 0, adxPrev = 0;
+   double bbUpper = 0, bbLower = 0, bbMiddle = 0;
+   double close0 = 0;
+   if(!CopyBuf1(g_hADX, 0, 0, adxVal)) { g_regimeRejectReason = "ADX_COPY_FAIL"; return REGIME_NO_TRADE; }
+   if(!CopyBuf1(g_hADX, 0, InpADXSlopeBars, adxPrev)) { g_regimeRejectReason = "ADX_SLOPE_FAIL"; return REGIME_NO_TRADE; }
+   if(!CopyBuf1(g_hBB, 1, 0, bbUpper)) { g_regimeRejectReason = "BB_COPY_FAIL"; return REGIME_NO_TRADE; }
+   if(!CopyBuf1(g_hBB, 2, 0, bbLower)) { g_regimeRejectReason = "BB_COPY_FAIL"; return REGIME_NO_TRADE; }
+   if(!CopyBuf1(g_hBB, 0, 0, bbMiddle)) { g_regimeRejectReason = "BB_COPY_FAIL"; return REGIME_NO_TRADE; }
+   close0 = iClose(InpSymbolName, InpExecTF, 0);
+   if(close0 <= 0) { g_regimeRejectReason = "PRICE_FAIL"; return REGIME_NO_TRADE; }
+   double bbWidth = (bbMiddle > 0) ? (bbUpper - bbLower) / bbMiddle : 0;
+   double adxSlope = adxVal - adxPrev;
+   // ATR percentile estimation
+   double atrArr[];
+   double atrNow = 0;
+   CopyBuf1(g_hATR, 0, 0, atrNow);
+   double atrPercentile = 50.0; // default
+   if(CopyBufN(g_hATR, 0, 0, 100, atrArr))
+   {
+      int countBelow = 0;
+      for(int i = 0; i < ArraySize(atrArr); i++)
+         if(atrArr[i] <= atrNow) countBelow++;
+      atrPercentile = (double)countBelow / (double)ArraySize(atrArr) * 100.0;
+   }
+   // Classification
+   bool trendSignal = (adxVal >= InpADXTrendThreshold && adxSlope > 0 && bbWidth >= InpBBWidthExpandThreshold);
+   bool rangeSignal = (adxVal <= InpADXWeakThreshold && bbWidth <= InpBBWidthCompressThreshold);
+   g_regimeConfidence = 0.0;
+   if(trendSignal)
+   {
+      g_regimeConfidence = MathMin(1.0, (adxVal / 50.0) * (bbWidth / InpBBWidthExpandThreshold));
+      g_regimeRejectReason = "";
+      g_currentRegime = REGIME_TREND_EXPANSION;
+      LogDecisionEvent("REGIME", "TREND_EXPANSION ADX=" + DoubleToString(adxVal,1) + " BBW=" + DoubleToString(bbWidth,5), g_regimeConfidence);
+      return REGIME_TREND_EXPANSION;
+   }
+   else if(rangeSignal)
+   {
+      g_regimeConfidence = MathMin(1.0, (1.0 - adxVal / InpADXTrendThreshold) * (1.0 - bbWidth / InpBBWidthExpandThreshold));
+      g_regimeRejectReason = "";
+      g_currentRegime = REGIME_MEAN_REVERSION;
+      LogDecisionEvent("REGIME", "MEAN_REVERSION ADX=" + DoubleToString(adxVal,1) + " BBW=" + DoubleToString(bbWidth,5), g_regimeConfidence);
+      return REGIME_MEAN_REVERSION;
+   }
+   else
+   {
+      if(!EnableNoTradeState)
+      {
+         // Fall back to trend if NO_TRADE disabled
+         g_currentRegime = REGIME_TREND_EXPANSION;
+         return REGIME_TREND_EXPANSION;
+      }
+      g_regimeRejectReason = "UNCERTAIN";
+      g_currentRegime = REGIME_NO_TRADE;
+      LogDecisionEvent("REGIME", "NO_TRADE ADX=" + DoubleToString(adxVal,1) + " BBW=" + DoubleToString(bbWidth,5), 0);
+      return REGIME_NO_TRADE;
+   }
+}
+//+------------------------------------------------------------------+
+//| MTF CONTEXT CHECK                                                |
+//+------------------------------------------------------------------+
+int GetMTFDirection()
+{
+   if(!EnableMTFContextCheck) return 0; // no filter
+   double emaFast5=0, emaSlow5=0, emaFast15=0, emaSlow15=0;
+   if(!CopyBuf1(g_hEMAFast_M5, 0, 0, emaFast5)) return 0;
+   if(!CopyBuf1(g_hEMASlow_M5, 0, 0, emaSlow5)) return 0;
+   if(!CopyBuf1(g_hEMAFast_M15, 0, 0, emaFast15)) return 0;
+   if(!CopyBuf1(g_hEMASlow_M15, 0, 0, emaSlow15)) return 0;
+   int dir5 = (emaFast5 > emaSlow5) ? 1 : -1;
+   int dir15 = (emaFast15 > emaSlow15) ? 1 : -1;
+   if(dir5 == dir15) return dir5;
+   return 0; // conflict
+}
+//+------------------------------------------------------------------+
+//| SETUP ENGINE — EvaluateTrendEntry                                |
+//+------------------------------------------------------------------+
+int EvaluateTrendEntry(double &quality)
+{
+   quality = 0;
+   if(!EnableTrendModule) return 0;
+   double emaFast=0, emaSlow=0, rsi=0, atr=0;
+   if(!CopyBuf1(g_hEMAFast, 0, 0, emaFast)) return 0;
+   if(!CopyBuf1(g_hEMASlow, 0, 0, emaSlow)) return 0;
+   if(!CopyBuf1(g_hRSI, 0, 0, rsi)) return 0;
+   if(!CopyBuf1(g_hATR, 0, 0, atr)) return 0;
+   double close0 = iClose(InpSymbolName, InpExecTF, 0);
+   double close1 = iClose(InpSymbolName, InpExecTF, 1);
+   double close2 = iClose(InpSymbolName, InpExecTF, 2);
+   double open0  = iOpen(InpSymbolName, InpExecTF, 0);
+   if(close0 <= 0 || close1 <= 0 || atr <= 0) return 0;
+   // Overextension filter
+   double distFromEMA = MathAbs(close0 - emaFast);
+   if(distFromEMA > InpOverextensionATRMult * atr) return 0;
+   // Body ratio filter
+   double bodySize = MathAbs(close0 - open0);
+   double candleRange = iHigh(InpSymbolName, InpExecTF, 0) - iLow(InpSymbolName, InpExecTF, 0);
+   if(candleRange > 0 && (bodySize / candleRange) < InpMinBodyRatio) return 0;
+   // MTF alignment
+   int mtfDir = GetMTFDirection();
+   // BUY setup
+   if(emaFast > emaSlow && close0 > emaFast && rsi > 40 && rsi < InpRSIOverbought)
+   {
+      // Pullback recovery: previous bar was near or below EMA, current reclaimed
+      bool pullback = (close1 <= emaFast * 1.001 || close2 <= emaFast * 1.001);
+      if(!pullback) pullback = (iLow(InpSymbolName, InpExecTF, 1) <= emaFast);
+      if(pullback)
+      {
+         if(mtfDir != 0 && mtfDir != 1) return 0; // MTF conflict
+         quality = 0.5 + (rsi - 40) / 60.0 * 0.3 + g_regimeConfidence * 0.2;
+         quality = MathMin(1.0, quality);
+         LogDecisionEvent("ENTRY_EVAL", "TREND_BUY quality=" + DoubleToString(quality,2), quality);
+         return 1;
+      }
+   }
+   // SELL setup
+   if(emaFast < emaSlow && close0 < emaFast && rsi < 60 && rsi > InpRSIOversold)
+   {
+      bool pullback = (close1 >= emaFast * 0.999 || close2 >= emaFast * 0.999);
+      if(!pullback) pullback = (iHigh(InpSymbolName, InpExecTF, 1) >= emaFast);
+      if(pullback)
+      {
+         if(mtfDir != 0 && mtfDir != -1) return 0;
+         quality = 0.5 + (60 - rsi) / 60.0 * 0.3 + g_regimeConfidence * 0.2;
+         quality = MathMin(1.0, quality);
+         LogDecisionEvent("ENTRY_EVAL", "TREND_SELL quality=" + DoubleToString(quality,2), quality);
+         return -1;
+      }
+   }
+   return 0;
+}
+//+------------------------------------------------------------------+
+//| SETUP ENGINE — EvaluateMeanReversionEntry                        |
+//+------------------------------------------------------------------+
+int EvaluateMeanReversionEntry(double &quality)
+{
+   quality = 0;
+   if(!EnableMeanReversionModule) return 0;
+   double bbUpper=0, bbLower=0, bbMiddle=0, rsi=0, atr=0, adxVal=0;
+   if(!CopyBuf1(g_hBB, 1, 0, bbUpper)) return 0;
+   if(!CopyBuf1(g_hBB, 2, 0, bbLower)) return 0;
+   if(!CopyBuf1(g_hBB, 0, 0, bbMiddle)) return 0;
+   if(!CopyBuf1(g_hRSI, 0, 0, rsi)) return 0;
+   if(!CopyBuf1(g_hATR, 0, 0, atr)) return 0;
+   if(!CopyBuf1(g_hADX, 0, 0, adxVal)) return 0;
+   double close0 = iClose(InpSymbolName, InpExecTF, 0);
+   double close1 = iClose(InpSymbolName, InpExecTF, 1);
+   double open0  = iOpen(InpSymbolName, InpExecTF, 0);
+   double low0   = iLow(InpSymbolName, InpExecTF, 0);
+   double high0  = iHigh(InpSymbolName, InpExecTF, 0);
+   if(close0 <= 0 || atr <= 0) return 0;
+   // Anti-fade filter: reject if ADX rising sharply (breakout pressure)
+   double adxPrev = 0;
+   CopyBuf1(g_hADX, 0, 3, adxPrev);
+   if(adxVal - adxPrev > 5.0) return 0; // strong breakout building, don't fade
+   // Body ratio
+   double bodySize = MathAbs(close0 - open0);
+   double candleRange = high0 - low0;
+   int mtfDir = GetMTFDirection();
+   // BUY (lower band bounce)
+   if(low0 <= bbLower && close0 > bbLower && rsi < InpRSIOversold + 10)
+   {
+      // Rejection candle: close in upper half
+      double clv = (candleRange > 0) ? (close0 - low0) / candleRange : 0.5;
+      if(clv < 0.4) return 0; // weak rejection
+      if(mtfDir != 0 && mtfDir != 1) return 0;
+      quality = 0.5 + (InpRSIOversold + 10 - rsi) / 40.0 * 0.3 + clv * 0.2;
+      quality = MathMin(1.0, quality);
+      LogDecisionEvent("ENTRY_EVAL", "MR_BUY quality=" + DoubleToString(quality,2), quality);
+      return 1;
+   }
+   // SELL (upper band rejection)
+   if(high0 >= bbUpper && close0 < bbUpper && rsi > InpRSIOverbought - 10)
+   {
+      double clv = (candleRange > 0) ? (high0 - close0) / candleRange : 0.5;
+      if(clv < 0.4) return 0;
+      if(mtfDir != 0 && mtfDir != -1) return 0;
+      quality = 0.5 + (rsi - (InpRSIOverbought - 10)) / 40.0 * 0.3 + clv * 0.2;
+      quality = MathMin(1.0, quality);
+      LogDecisionEvent("ENTRY_EVAL", "MR_SELL quality=" + DoubleToString(quality,2), quality);
+      return -1;
+   }
+   return 0;
+}
+//+------------------------------------------------------------------+
+//| ENTRY EVALUATION — Main                                          |
+//+------------------------------------------------------------------+
+void EvaluateEntry()
+{
+   // Pre-checks
+   if(IsTradingLocked())
+   {
+      LogDecisionEvent("PRECHECK", "Trading locked by RiskGovernor", 0);
+      return;
+   }
+   if(!IsWithinSession())
+   {
+      if(EnableDebugPrints) Print("DEBUG: Outside trading session");
+      return;
+   }
+   if(IsNewsBlocked())
+   {
+      LogDecisionEvent("PRECHECK", "News window block active", 0);
+      return;
+   }
+   // Spread entry filter
+   if(EnableSpreadEntryFilter)
+   {
+      double spread = CurrentSpreadPoints();
+      if(spread > InpMaxSpreadPoints)
+      {
+         LogDecisionEvent("PRECHECK", "Spread too high: " + DoubleToString(spread,1), 0);
+         return;
+      }
+   }
+   // One position only
+   if(EnableOnePositionOnly && IsOurPosition())
+   {
+      return;
+   }
+   // Detect regime
+   ENUM_REGIME regime = DetectRegime();
+   if(regime == REGIME_NO_TRADE) return;
+   // Evaluate setup based on regime
+   double quality = 0;
+   int side = 0;
+   if(regime == REGIME_TREND_EXPANSION)
+   {
+      side = EvaluateTrendEntry(quality);
+   }
+   else if(regime == REGIME_MEAN_REVERSION)
+   {
+      side = EvaluateMeanReversionEntry(quality);
+   }
+   if(side == 0) return;
+   if(quality < InpMinSetupQuality)
+   {
+      LogDecisionEvent("ENTRY_DECISION", "Rejected: quality " + DoubleToString(quality,2) + " < threshold", quality);
+      return;
+   }
+   // Open trade
+   OpenTrade(side, regime);
+}
+//+------------------------------------------------------------------+
+//| OPEN TRADE                                                       |
+//+------------------------------------------------------------------+
+void OpenTrade(int side, ENUM_REGIME regime)
+{
+   double atr = 0;
+   if(!CopyBuf1(g_hATR, 0, 1, atr) || atr <= 0)
+   {
+      LogDecisionEvent("ORDER_SUBMIT", "ATR read fail, cannot compute SL", 0);
+      return;
+   }
+   double ask = SymbolInfoDouble(InpSymbolName, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(InpSymbolName, SYMBOL_BID);
+   if(ask <= 0 || bid <= 0) return;
+   double slDist = atr * InpATRSLMultiplier;
+   double tpDist = slDist * InpInitialTPMultR;
+   double entryPrice, sl, tp;
+   ENUM_ORDER_TYPE orderType;
+   if(side == 1)
+   {
+      entryPrice = ask;
+      sl = NormalizePrice(entryPrice - slDist);
+      tp = NormalizePrice(entryPrice + tpDist);
+      orderType = ORDER_TYPE_BUY;
+   }
+   else
+   {
+      entryPrice = bid;
+      sl = NormalizePrice(entryPrice + slDist);
+      tp = NormalizePrice(entryPrice - tpDist);
+      orderType = ORDER_TYPE_SELL;
+   }
+   // Validate stop distance vs broker minimum
+   long stopsLevel = SymbolInfoInteger(InpSymbolName, SYMBOL_TRADE_STOPS_LEVEL);
+   double minStopDist = stopsLevel * SymbolInfoDouble(InpSymbolName, SYMBOL_POINT);
+   if(slDist < minStopDist)
+   {
+      slDist = minStopDist * 1.1;
+      if(side == 1) sl = NormalizePrice(entryPrice - slDist);
+      else          sl = NormalizePrice(entryPrice + slDist);
+   }
+   double lots = CalcLotSizeByRisk(slDist);
+   // Margin check
+   double marginRequired = 0;
+   if(!OrderCalcMargin(orderType, InpSymbolName, lots, entryPrice, marginRequired))
+   {
+      LogDecisionEvent("ORDER_SUBMIT", "Margin calc fail", 0);
+      return;
+   }
+   if(marginRequired > AccountInfoDouble(ACCOUNT_MARGIN_FREE) * 0.9)
+   {
+      LogDecisionEvent("ORDER_SUBMIT", "Insufficient margin", 0);
+      return;
+   }
+   // Send order with retry
+   bool success = false;
+   double spreadAtEntry = CurrentSpreadPoints();
+   for(int retry = 0; retry < InpMaxRetries; retry++)
+   {
+      if(side == 1)
+         success = g_trade.Buy(lots, InpSymbolName, 0, sl, tp, "MDAE_" + EnumToString(regime));
+      else
+         success = g_trade.Sell(lots, InpSymbolName, 0, sl, tp, "MDAE_" + EnumToString(regime));
+      if(success)
+      {
+         ulong resultTicket = g_trade.ResultOrder();
+         if(resultTicket > 0)
+         {
+            // Initialize managed state
+            g_ms.active = true;
+            g_ms.ticket = resultTicket;
+            g_ms.direction = side;
+            g_ms.entryPrice = (side == 1) ? ask : bid;
+            g_ms.initialSL = sl;
+            g_ms.initialTP = tp;
+            g_ms.initialVolume = lots;
+            g_ms.riskDistance = slDist;
+            g_ms.mfe = 0;
+            g_ms.mae = 0;
+            g_ms.currentR = 0;
+            g_ms.beApplied = false;
+            g_ms.partial1Done = false;
+            g_ms.partial2Done = false;
+            g_ms.activeMethod = (regime == REGIME_MEAN_REVERSION) ? CM_FIXED : CM_ATR;
+            g_ms.policySwitchCount = 0;
+            g_ms.entryTime = TimeCurrent();
+            g_ms.entryBar = 0;
+            g_ms.barsInTrade = 0;
+            g_ms.lastSpreadAtEntry = spreadAtEntry;
+            g_ms.lastSlippageAtEntry = 0;
+            g_ms.complianceViolationCount = 0;
+            g_ms.stopChangedDueSpread = false;
+            g_ms.stopChangedDueSlippage = false;
+            g_sessionTradeCount++;
+            LogDecisionEvent("ORDER_SUBMIT", "Opened " + ((side==1)?"BUY":"SELL") +
+               " lots=" + DoubleToString(lots,2) +
+               " SL=" + DoubleToString(sl, (int)SymbolInfoInteger(InpSymbolName, SYMBOL_DIGITS)) +
+               " TP=" + DoubleToString(tp, (int)SymbolInfoInteger(InpSymbolName, SYMBOL_DIGITS)) +
+               " spread=" + DoubleToString(spreadAtEntry,1), 0);
+         }
+         break;
+      }
+      else
+      {
+         int err = (int)g_trade.ResultRetcode();
+         if(EnableDebugPrints) Print("DEBUG: Order send retry ", retry, " err=", err);
+         if(err == 10004 || err == 10006 || err == 10013) // requote / reject / invalid price
+            Sleep(200);
+         else
+            break;
+      }
+   }
+   if(!success)
+   {
+      LogDecisionEvent("ORDER_SUBMIT", "FAILED retcode=" + IntegerToString(g_trade.ResultRetcode()), 0);
+   }
+}
+//+------------------------------------------------------------------+
+//| MDAE FEATURES — ComputePipsPerSecond                             |
+//+------------------------------------------------------------------+
+struct MDAEFeatures
+{
+   double speedNow;
+   double speedShort;
+   double speedLong;
+   double acceleration;
+   double volumePulse;
+   double bodyExpansion;
+   bool   top2Breakout;
+   bool   inLowVolBox;
+   double fibProximity;
+   double entropyScore;
+   double continuationScore;
+};
+void ComputeMDAEFeatures(MDAEFeatures &feat)
+{
+   ZeroMemory(feat);
+   double close0 = iClose(InpSymbolName, InpExecTF, 0);
+   if(close0 <= 0) return;
+   // Speed: pips per second
+   if(EnablePipsPerSecond)
+   {
+      double close1 = iClose(InpSymbolName, InpExecTF, 1);
+      datetime time0 = iTime(InpSymbolName, InpExecTF, 0);
+      datetime time1 = iTime(InpSymbolName, InpExecTF, 1);
+      double dtSec = (double)(time0 - time1);
+      if(dtSec > 0)
+         feat.speedNow = MathAbs(close0 - close1) / dtSec;
+      // Short baseline
+      double closeS = iClose(InpSymbolName, InpExecTF, InpSpeedWindowShort);
+      datetime timeS = iTime(InpSymbolName, InpExecTF, InpSpeedWindowShort);
+      double dtS = (double)(time0 - timeS);
+      if(dtS > 0)
+         feat.speedShort = MathAbs(close0 - closeS) / dtS;
+      // Long baseline
+      double closeL = iClose(InpSymbolName, InpExecTF, InpSpeedWindowLong);
+      datetime timeL = iTime(InpSymbolName, InpExecTF, InpSpeedWindowLong);
+      double dtL = (double)(time0 - timeL);
+      if(dtL > 0)
+         feat.speedLong = MathAbs(close0 - closeL) / dtL;
+      feat.acceleration = (feat.speedLong > 0) ? feat.speedShort / feat.speedLong : 1.0;
+   }
+   // Volume pulse
+   if(EnableVolumePulse)
+   {
+      long vol0 = iVolume(InpSymbolName, InpExecTF, 0);
+      double volAvg = 0;
+      for(int i = 1; i <= InpVolumeAvgPeriod; i++)
+         volAvg += (double)iVolume(InpSymbolName, InpExecTF, i);
+      volAvg /= InpVolumeAvgPeriod;
+      feat.volumePulse = (volAvg > 0) ? (double)vol0 / volAvg : 1.0;
+   }
+   // Body expansion
+   if(EnableBodyExpansion)
+   {
+      double body0 = MathAbs(iClose(InpSymbolName, InpExecTF, 0) - iOpen(InpSymbolName, InpExecTF, 0));
+      double body1 = MathAbs(iClose(InpSymbolName, InpExecTF, 1) - iOpen(InpSymbolName, InpExecTF, 1));
+      feat.bodyExpansion = (body1 > 0) ? body0 / body1 : 1.0;
+   }
+   // Top-2 breakout
+   if(EnableTop2BreakoutCheck)
+   {
+      double highest = close0, secondHighest = close0;
+      double lowest = close0, secondLowest = close0;
+      for(int i = 1; i <= InpTop2Lookback; i++)
+      {
+         double h = iHigh(InpSymbolName, InpExecTF, i);
+         double l = iLow(InpSymbolName, InpExecTF, i);
+         if(h > highest) { secondHighest = highest; highest = h; }
+         else if(h > secondHighest) secondHighest = h;
+         if(l < lowest) { secondLowest = lowest; lowest = l; }
+         else if(l < secondLowest) secondLowest = l;
+      }
+      if(g_ms.direction == 1)
+         feat.top2Breakout = (close0 > secondHighest);
+      else
+         feat.top2Breakout = (close0 < secondLowest);
+   }
+   // Low volume box
+   if(EnableLowVolumeBox)
+   {
+      double volAvg = 0;
+      for(int i = 0; i < InpLowVolBoxPeriod; i++)
+         volAvg += (double)iVolume(InpSymbolName, InpExecTF, i);
+      volAvg /= InpLowVolBoxPeriod;
+      double longVolAvg = 0;
+      for(int i = 0; i < InpVolumeAvgPeriod; i++)
+         longVolAvg += (double)iVolume(InpSymbolName, InpExecTF, i);
+      longVolAvg /= InpVolumeAvgPeriod;
+      feat.inLowVolBox = (longVolAvg > 0 && volAvg / longVolAvg < InpLowVolBoxThreshold);
+   }
+   // Fib guidance
+   if(EnableFibGuidance && g_ms.active && g_ms.riskDistance > 0)
+   {
+      double progress = g_ms.currentR;
+      feat.fibProximity = 0;
+      if(MathAbs(progress - InpFibLevel1) < 0.1) feat.fibProximity = 0.7;
+      if(MathAbs(progress - InpFibLevel2) < 0.1) feat.fibProximity = 1.0;
+   }
+   // Entropy scoring
+   if(EnableEntropyScoring)
+   {
+      // Composite uncertainty: high when signals conflict
+      double speedSignal = (feat.acceleration > 1.2) ? 1.0 : (feat.acceleration < 0.8) ? -1.0 : 0.0;
+      double volSignal   = (feat.volumePulse > InpVolumePulseThreshold) ? 1.0 : (feat.volumePulse < 0.7) ? -1.0 : 0.0;
+      double structSignal = feat.top2Breakout ? 1.0 : 0.0;
+      double boxSignal   = feat.inLowVolBox ? -1.0 : 0.0;
+      double sum = speedSignal + volSignal + structSignal + boxSignal;
+      double maxAbs = 4.0;
+      double agreement = MathAbs(sum) / maxAbs;
+      feat.entropyScore = 1.0 - agreement; // high entropy = disagreement
+      // Continuation score
+      feat.continuationScore = (sum > 0 && g_ms.direction == 1) || (sum < 0 && g_ms.direction == -1) ?
+                               agreement : (1.0 - agreement) * 0.3;
+   }
+}
+//+------------------------------------------------------------------+
+//| MDAE — SelectCloseMethod                                         |
+//+------------------------------------------------------------------+
+ENUM_CLOSE_METHOD SelectCloseMethod(const MDAEFeatures &feat)
+{
+   if(!EnableMDAE) return CM_FIXED;
+   // Invalidation / thesis break
+   if(feat.entropyScore > InpEntropyHighThreshold && feat.continuationScore < InpExhaustionThreshold)
+   {
+      return CM_EXIT;
+   }
+   // Fast bank mode
+   if(EnableFastBankMode && feat.inLowVolBox && g_ms.currentR > InpFastBankTriggerR)
+   {
+      return CM_FAST;
+   }
+   // Trend continuation: speed + volume + breakout
+   if(feat.continuationScore > InpContinuationThreshold)
+   {
+      if(EnableSwingTrail && feat.top2Breakout && feat.volumePulse > InpVolumePulseThreshold)
+         return CM_SWING;
+      if(EnableATRTrail)
+         return CM_ATR;
+   }
+   // Hybrid: mixed signals
+   if(EnableHybridCloseMode && feat.entropyScore > 0.4 && feat.entropyScore <= InpEntropyHighThreshold)
+   {
+      return CM_HYBRID;
+   }
+   // Default fixed
+   return CM_FIXED;
+}
+//+------------------------------------------------------------------+
+//| COMPLIANCE — Check Stop Policy                                   |
+//+------------------------------------------------------------------+
+bool ComplianceCheckStopPolicy(double newSL, string reason)
+{
+   if(!EnableComplianceAuditCounters) return true;
+   g_complianceTotalChecks++;
+   bool violation = false;
+   if(EnforceNoSpreadSlStopMoves)
+   {
+      // Check if reason contains spread-triggered logic
+      if(StringFind(reason, "SPREAD_TRIGGER") >= 0)
+      {
+         violation = true;
+         g_ms.stopChangedDueSpread = true;
+         LogDecisionEvent("COMPLIANCE", "VIOLATION: Stop move due to spread: " + reason, 0);
+      }
+   }
+   if(EnforceNoSlippageStopMoves)
+   {
+      if(StringFind(reason, "SLIPPAGE_TRIGGER") >= 0)
+      {
+         violation = true;
+         g_ms.stopChangedDueSlippage = true;
+         LogDecisionEvent("COMPLIANCE", "VIOLATION: Stop move due to slippage: " + reason, 0);
+      }
+   }
+   if(violation)
+   {
+      g_complianceTotalViolations++;
+      g_ms.complianceViolationCount++;
+      return false; // block the stop modification
+   }
+   return true;
+}
+//+------------------------------------------------------------------+
+//| POSITION MANAGEMENT — MoveSL                                     |
+//+------------------------------------------------------------------+
+bool MoveSL(double newSL, string reason)
+{
+   if(!g_ms.active) return false;
+   if(!PositionSelectByTicket(g_ms.ticket)) return false;
+   // Compliance check
+   if(!ComplianceCheckStopPolicy(newSL, reason))
+   {
+      if(EnableDebugPrints) Print("DEBUG: SL move BLOCKED by compliance: ", reason);
+      return false;
+   }
+   double currentSL = PositionGetDouble(POSITION_SL);
+   double currentTP = PositionGetDouble(POSITION_TP);
+   newSL = NormalizePrice(newSL);
+   // Don't move SL worse
+   if(g_ms.direction == 1 && newSL <= currentSL && currentSL > 0) return false;
+   if(g_ms.direction == -1 && newSL >= currentSL && currentSL > 0) return false;
+   // Validate against stops level
+   double ask = SymbolInfoDouble(InpSymbolName, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(InpSymbolName, SYMBOL_BID);
+   long stopsLevel = SymbolInfoInteger(InpSymbolName, SYMBOL_TRADE_STOPS_LEVEL);
+   long freezeLevel = SymbolInfoInteger(InpSymbolName, SYMBOL_TRADE_FREEZE_LEVEL);
+   double point = SymbolInfoDouble(InpSymbolName, SYMBOL_POINT);
+   double minDist = MathMax((double)stopsLevel, (double)freezeLevel) * point;
+   if(g_ms.direction == 1)
+   {
+      if(bid - newSL < minDist) return false;
+   }
+   else
+   {
+      if(newSL - ask < minDist) return false;
+   }
+   if(g_trade.PositionModify(g_ms.ticket, newSL, currentTP))
+   {
+      LogDecisionEvent("MANAGEMENT", "SL moved to " + DoubleToString(newSL, (int)SymbolInfoInteger(InpSymbolName, SYMBOL_DIGITS)) + " reason=" + reason, g_ms.currentR);
+      return true;
+   }
+   else
+   {
+      if(EnableDebugPrints) Print("DEBUG: SL modify failed, retcode=", g_trade.ResultRetcode());
+      return false;
+   }
+}
+//+------------------------------------------------------------------+
+//| POSITION MANAGEMENT — PartialClose                               |
+//+------------------------------------------------------------------+
+bool PartialClosePercent(double pctOfOriginal, string reason)
+{
+   if(!EnablePartialClose) return false;
+   if(!g_ms.active) return false;
+   if(!PositionSelectByTicket(g_ms.ticket)) return false;
+   double currentVol = PositionGetDouble(POSITION_VOLUME);
+   double closeVol = g_ms.initialVolume * pctOfOriginal / 100.0;
+   closeVol = NormalizeLot(closeVol);
+   double minLot = SymbolInfoDouble(InpSymbolName, SYMBOL_VOLUME_MIN);
+   if(closeVol < minLot)
+   {
+      LogDecisionEvent("MANAGEMENT", "Partial skip: volume " + DoubleToString(closeVol,2) + " < minLot", g_ms.currentR);
+      return false;
+   }
+   if(closeVol > currentVol) closeVol = currentVol;
+   // Ensure remainder is valid
+   double remainder = NormalizeLot(currentVol - closeVol);
+   if(remainder > 0 && remainder < minLot)
+   {
+      closeVol = currentVol; // close all if remainder would be invalid
+   }
+   bool result = false;
+   if(g_ms.direction == 1)
+      result = g_trade.Sell(closeVol, InpSymbolName, 0, 0, 0, "MDAE_Partial");
+   else
+      result = g_trade.Buy(closeVol, InpSymbolName, 0, 0, 0, "MDAE_Partial");
+   if(result)
+   {
+      LogDecisionEvent("MANAGEMENT", "Partial close " + DoubleToString(pctOfOriginal,0) + "% vol=" + DoubleToString(closeVol,2) + " reason=" + reason, g_ms.currentR);
+   }
+   return result;
+}
+//+------------------------------------------------------------------+
+//| POSITION MANAGEMENT — ApplyBreakEven                             |
+//+------------------------------------------------------------------+
+void ApplyBreakEven()
+{
+   if(!EnableBreakEven) return;
+   if(g_ms.beApplied) return;
+   if(g_ms.barsInTrade < InpMinBarsBeforeBE) return;
+   if(g_ms.currentR >= InpBETriggerR)
+   {
+      double bePrice;
+      if(g_ms.direction == 1)
+         bePrice = g_ms.entryPrice + InpBEBufferPoints * SymbolInfoDouble(InpSymbolName, SYMBOL_POINT);
+      else
+         bePrice = g_ms.entryPrice - InpBEBufferPoints * SymbolInfoDouble(InpSymbolName, SYMBOL_POINT);
+      if(MoveSL(bePrice, "BREAK_EVEN"))
+      {
+         g_ms.beApplied = true;
+         LogDecisionEvent("MANAGEMENT", "Break-even applied at " + DoubleToString(g_ms.currentR,2) + "R", g_ms.currentR);
+      }
+   }
+}
+//+------------------------------------------------------------------+
+//| POSITION MANAGEMENT — ApplyPartialClose                          |
+//+------------------------------------------------------------------+
+void ApplyPartialClose()
+{
+   if(!EnablePartialClose) return;
+   // Partial 1
+   if(!g_ms.partial1Done && g_ms.currentR >= InpPartial1TriggerR)
+   {
+      if(PartialClosePercent(InpPartial1Pct, "TP1_HIT"))
+         g_ms.partial1Done = true;
+   }
+   // Partial 2
+   if(!g_ms.partial2Done && g_ms.currentR >= InpPartial2TriggerR)
+   {
+      if(PartialClosePercent(InpPartial2Pct, "TP2_HIT"))
+         g_ms.partial2Done = true;
+   }
+}
+//+------------------------------------------------------------------+
+//| POSITION MANAGEMENT — ApplyTrailingLogic                         |
+//+------------------------------------------------------------------+
+void ApplyTrailingLogic(const MDAEFeatures &feat)
+{
+   double atr = 0;
+   CopyBuf1(g_hATR, 0, 0, atr);
+   if(atr <= 0) return;
+   double ask = SymbolInfoDouble(InpSymbolName, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(InpSymbolName, SYMBOL_BID);
+   double currentPrice = (g_ms.direction == 1) ? bid : ask;
+   ENUM_CLOSE_METHOD method = g_ms.activeMethod;
+   // ATR Trail
+   if(method == CM_ATR && EnableATRTrail)
+   {
+      double trailSL;
+      if(g_ms.direction == 1)
+         trailSL = currentPrice - atr * InpATRTrailMultiplier;
+      else
+         trailSL = currentPrice + atr * InpATRTrailMultiplier;
+      MoveSL(trailSL, "ATR_TRAIL");
+   }
+   // Swing Trail
+   if(method == CM_SWING && EnableSwingTrail)
+   {
+      double swingLevel = 0;
+      if(g_ms.direction == 1)
+      {
+         swingLevel = iLow(InpSymbolName, InpExecTF, 1);
+         for(int i = 2; i <= InpSwingLookback; i++)
+         {
+            double lo = iLow(InpSymbolName, InpExecTF, i);
+            if(lo < swingLevel) swingLevel = lo;
+         }
+         // Use the highest recent swing low
+         double recentSwingLow = iLow(InpSymbolName, InpExecTF, 1);
+         for(int i = 2; i <= MathMin(InpSwingLookback, 5); i++)
+         {
+            double lo = iLow(InpSymbolName, InpExecTF, i);
+            if(lo > recentSwingLow) // highest swing low = most protective
+               recentSwingLow = lo;
+            // but ensure it's actually a swing (lower bars on both sides)
+         }
+         MoveSL(recentSwingLow - atr * 0.2, "SWING_TRAIL");
+      }
+      else
+      {
+         double recentSwingHigh = iHigh(InpSymbolName, InpExecTF, 1);
+         for(int i = 2; i <= MathMin(InpSwingLookback, 5); i++)
+         {
+            double hi = iHigh(InpSymbolName, InpExecTF, i);
+            if(hi < recentSwingHigh)
+               recentSwingHigh = hi;
+         }
+         MoveSL(recentSwingHigh + atr * 0.2, "SWING_TRAIL");
+      }
+   }
+   // Fast Bank
+   if(method == CM_FAST && EnableFastBankMode)
+   {
+      double trailSL;
+      double point = SymbolInfoDouble(InpSymbolName, SYMBOL_POINT);
+      if(g_ms.direction == 1)
+         trailSL = currentPrice - InpFastBankTrailPoints * point;
+      else
+         trailSL = currentPrice + InpFastBankTrailPoints * point;
+      MoveSL(trailSL, "FAST_BANK_TRAIL");
+   }
+   // Hybrid: blend ATR and structure
+   if(method == CM_HYBRID && EnableHybridCloseMode)
+   {
+      double atrSL, structSL;
+      if(g_ms.direction == 1)
+      {
+         atrSL = currentPrice - atr * InpATRTrailMultiplier;
+         double recentLow = iLow(InpSymbolName, InpExecTF, 1);
+         for(int i = 2; i <= MathMin(InpSwingLookback, 5); i++)
+         {
+            double lo = iLow(InpSymbolName, InpExecTF, i);
+            if(lo > recentLow) recentLow = lo;
+         }
+         structSL = recentLow - atr * 0.2;
+         // Pick most protective (higher for longs)
+         double bestSL = MathMax(atrSL, structSL);
+         MoveSL(bestSL, "HYBRID_TRAIL");
+      }
+      else
+      {
+         atrSL = currentPrice + atr * InpATRTrailMultiplier;
+         double recentHigh = iHigh(InpSymbolName, InpExecTF, 1);
+         for(int i = 2; i <= MathMin(InpSwingLookback, 5); i++)
+         {
+            double hi = iHigh(InpSymbolName, InpExecTF, i);
+            if(hi < recentHigh) recentHigh = hi;
+         }
+         structSL = recentHigh + atr * 0.2;
+         double bestSL = MathMin(atrSL, structSL);
+         MoveSL(bestSL, "HYBRID_TRAIL");
+      }
+   }
+}
+//+------------------------------------------------------------------+
+//| POSITION MANAGEMENT — CheckInvalidationExit                      |
+//+------------------------------------------------------------------+
+bool CheckInvalidationExit(const MDAEFeatures &feat)
+{
+   if(!EnableInvalidationExit) return false;
+   // 1) Hard thesis break: regime flipped against position
+   ENUM_REGIME currentRegime = DetectRegime();
+   // Trend position but regime went MEAN_REVERSION or NO_TRADE with low continuation
+   if(feat.continuationScore < InpExhaustionThreshold && feat.entropyScore > InpEntropyHighThreshold)
+   {
+      LogDecisionEvent("MANAGEMENT", "Invalidation: High entropy + low continuation", g_ms.currentR);
+      return true;
+   }
+   // 2) Sustained momentum collapse (speed near zero for extended period)
+   if(feat.speedShort < feat.speedLong * 0.2 && feat.volumePulse < 0.5 && g_ms.currentR < 0.5)
+   {
+      LogDecisionEvent("MANAGEMENT", "Invalidation: Momentum collapse", g_ms.currentR);
+      return true;
+   }
+   return false;
+}
+//+------------------------------------------------------------------+
+//| POSITION MANAGEMENT — CheckTimeStopExit                          |
+//+------------------------------------------------------------------+
+bool CheckTimeStopExit()
+{
+   if(!EnableTimeStop) return false;
+   if(g_ms.barsInTrade >= InpMaxTradeAgeBars)
+   {
+      // Only time-stop if trade isn't significantly profitable
+      if(g_ms.currentR < 1.0)
+      {
+         LogDecisionEvent("MANAGEMENT", "Time stop: " + IntegerToString(g_ms.barsInTrade) + " bars, R=" + DoubleToString(g_ms.currentR,2), g_ms.currentR);
+         return true;
+      }
+   }
+   return false;
+}
+//+------------------------------------------------------------------+
+//| POSITION MANAGEMENT — Full Close                                 |
+//+------------------------------------------------------------------+
+void ClosePosition(string reason)
+{
+   if(!g_ms.active) return;
+   if(!PositionSelectByTicket(g_ms.ticket)) return;
+   double vol = PositionGetDouble(POSITION_VOLUME);
+   bool result = false;
+   if(g_ms.direction == 1)
+      result = g_trade.Sell(vol, InpSymbolName, 0, 0, 0, "MDAE_Close_" + reason);
+   else
+      result = g_trade.Buy(vol, InpSymbolName, 0, 0, 0, "MDAE_Close_" + reason);
+   if(result)
+   {
+      LogDecisionEvent("EXIT", "Full close reason=" + reason, g_ms.currentR);
+   }
+   else
+   {
+      if(EnableDebugPrints) Print("DEBUG: Close failed, retcode=", g_trade.ResultRetcode());
+   }
+}
+//+------------------------------------------------------------------+
+//| MAIN POSITION MANAGEMENT ENGINE                                  |
+//+------------------------------------------------------------------+
+void ManagePosition()
+{
+   if(!g_ms.active) return;
+   if(!PositionSelectByTicket(g_ms.ticket))
+   {
+      // Position no longer exists
+      ResetManagedState();
+      return;
+   }
+   // Update live metrics
+   double currentPrice;
+   if(g_ms.direction == 1)
+      currentPrice = SymbolInfoDouble(InpSymbolName, SYMBOL_BID);
+   else
+      currentPrice = SymbolInfoDouble(InpSymbolName, SYMBOL_ASK);
+   double pnlPrice = (currentPrice - g_ms.entryPrice) * g_ms.direction;
+   g_ms.currentR = (g_ms.riskDistance > 0) ? pnlPrice / g_ms.riskDistance : 0;
+   if(pnlPrice > g_ms.mfe) g_ms.mfe = pnlPrice;
+   if(pnlPrice < g_ms.mae) g_ms.mae = pnlPrice;
+   // Update bars in trade
+   datetime curBarTime = iTime(InpSymbolName, InpExecTF, 0);
+   if(curBarTime > 0 && g_ms.entryTime > 0)
+      g_ms.barsInTrade = (int)((curBarTime - g_ms.entryTime) / PeriodSeconds(InpExecTF));
+   // Compute MDAE features
+   MDAEFeatures feat;
+   ComputeMDAEFeatures(feat);
+   // Select close method with bounded switching
+   if(EnableMDAE && EnablePolicySwitching)
+   {
+      ENUM_CLOSE_METHOD desired = SelectCloseMethod(feat);
+      if(desired != g_ms.activeMethod)
+      {
+         if(g_ms.policySwitchCount < InpMaxPolicySwitches)
+         {
+            LogDecisionEvent("MDAE_METHOD", "Switch " + EnumToString(g_ms.activeMethod) + " -> " + EnumToString(desired) +
+               " entropy=" + DoubleToString(feat.entropyScore,2) + " cont=" + DoubleToString(feat.continuationScore,2), g_ms.currentR);
+            g_ms.activeMethod = desired;
+            g_ms.policySwitchCount++;
+         }
+      }
+   }
+   // 1) Check invalidation exit
+   if(CheckInvalidationExit(feat))
+   {
+      ClosePosition("INVALIDATION");
+      return;
+   }
+   // 2) Check time stop
+   if(CheckTimeStopExit())
+   {
+      ClosePosition("TIME_STOP");
+      return;
+   }
+   // 3) If method is EXIT, close now
+   if(g_ms.activeMethod == CM_EXIT)
+   {
+      ClosePosition("CM_EXIT");
+      return;
+   }
+   // 4) Partials
+   ApplyPartialClose();
+   // 5) Break-even
+   ApplyBreakEven();
+   // 6) Trailing
+   ApplyTrailingLogic(feat);
+}
+//+------------------------------------------------------------------+
+//| LOGGING — LogDecisionEvent                                       |
+//+------------------------------------------------------------------+
+void LogDecisionEvent(string eventType, string detail, double score)
+{
+   if(!EnableLogging) return;
+   string ts = TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS);
+   double spread = CurrentSpreadPoints();
+   if(g_logHandle != INVALID_HANDLE)
+   {
+      FileWrite(g_logHandle, ts, InpSymbolName,
+         (g_ms.active ? IntegerToString(g_ms.ticket) : "0"),
+         eventType, EnumToString(g_currentRegime),
+         (g_ms.active ? IntegerToString(g_ms.direction) : "0"),
+         DoubleToString(g_ms.currentR, 3),
+         EnumToString(g_ms.activeMethod),
+         detail, "",
+         DoubleToString(spread, 1), "",
+         DoubleToString(score, 3),
+         (g_ms.stopChangedDueSpread ? "true" : "false"),
+         (g_ms.stopChangedDueSlippage ? "true" : "false"));
+   }
+   if(EnableDebugPrints)
+   {
+      Print("[", eventType, "] ", detail, " R=", DoubleToString(g_ms.currentR,2), " spread=", DoubleToString(spread,1));
+   }
+}
+//+------------------------------------------------------------------+
+//| LOGGING — LogTradeSummary                                        |
+//+------------------------------------------------------------------+
+void LogTradeSummary(string closeType, double profit)
+{
+   if(!EnableLogging) return;
+   string ts = TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS);
+   string detail = "CloseType=" + closeType +
+      " Profit=" + DoubleToString(profit, 2) +
+      " MFE=" + DoubleToString(g_ms.mfe / g_ms.riskDistance, 2) + "R" +
+      " MAE=" + DoubleToString(g_ms.mae / g_ms.riskDistance, 2) + "R" +
+      " Bars=" + IntegerToString(g_ms.barsInTrade) +
+      " Method=" + EnumToString(g_ms.activeMethod) +
+      " Switches=" + IntegerToString(g_ms.policySwitchCount) +
+      " ComplianceViolations=" + IntegerToString(g_ms.complianceViolationCount);
+   if(g_logHandle != INVALID_HANDLE)
+   {
+      FileWrite(g_logHandle, ts, InpSymbolName, IntegerToString(g_ms.ticket),
+         "EXIT_SUMMARY", EnumToString(g_currentRegime),
+         IntegerToString(g_ms.direction),
+         DoubleToString(g_ms.currentR, 3),
+         EnumToString(g_ms.activeMethod),
+         detail, closeType,
+         DoubleToString(CurrentSpreadPoints(), 1), "",
+         "0",
+         (g_ms.stopChangedDueSpread ? "true" : "false"),
+         (g_ms.stopChangedDueSlippage ? "true" : "false"));
+   }
+   Print("[TRADE_SUMMARY] ", detail);
+}
+//+------------------------------------------------------------------+     mql4 :  //+------------------------------------------------------------------+
+//|                        XAUUSD_Adaptive_MDAE_EA.mq4               |
+//|       Production-Grade Adaptive MDAE Expert Advisor for MT4      |
+//|           Version 1.0 — Full Implementation, No Placeholders     |
+//+------------------------------------------------------------------+
+//| MT4 LIMITATIONS ANNOTATED:                                       |
+//|  - No CTrade class; uses OrderSend/OrderModify/OrderClose        |
+//|  - No PositionSelectByTicket; iterates OrdersTotal()             |
+//|  - No OnTradeTransaction; loss tracking in OnTick                |
+//|  - No iADX multi-buffer; uses iADX() direct calls               |
+//|  - No grouped inputs; uses comment-based grouping                |
+//|  - No ORDER_FILLING modes; handled natively by MT4               |
+//|  - No SymbolInfoInteger for SYMBOL_TRADE_FREEZE_LEVEL in old MT4 |
+//+------------------------------------------------------------------+
+#property copyright "XAUUSD Adaptive MDAE"
+#property link      ""
+#property version   "1.00"
+#property strict
+//+------------------------------------------------------------------+
+//| ENUMERATIONS                                                     |
+//+------------------------------------------------------------------+
+enum ENUM_REGIME
+{
+   REGIME_NO_TRADE        = 0,
+   REGIME_TREND_EXPANSION = 1,
+   REGIME_MEAN_REVERSION  = 2
+};
+enum ENUM_CLOSE_METHOD
+{
+   CM_FIXED  = 0,
+   CM_ATR    = 1,
+   CM_SWING  = 2,
+   CM_FAST   = 3,
+   CM_EXIT   = 4,
+   CM_HYBRID = 5
+};
+enum ENUM_RISK_STATE
+{
+   RISK_ALLOW  = 0,
+   RISK_REDUCE = 1,
+   RISK_BLOCK  = 2
+};
+//+------------------------------------------------------------------+
+//| INPUTS — MASTER TOGGLES                                          |
+//+------------------------------------------------------------------+
+// --- Master Toggles ---
+extern bool   EnableEA                     = true;
+extern bool   EnableEntries                = true;
+extern bool   EnablePositionManagement     = true;
+extern bool   EnableLogging                = true;
+extern bool   EnableDebugPrints            = false;
+//+------------------------------------------------------------------+
+//| INPUTS — REGIME / ENTRY TOGGLES                                  |
+//+------------------------------------------------------------------+
+// --- Regime & Entry Toggles ---
+extern bool   EnableRegimeEngine           = true;
+extern bool   EnableTrendModule            = true;
+extern bool   EnableMeanReversionModule    = true;
+extern bool   EnableNoTradeState           = true;
+extern bool   EnableMTFContextCheck        = true;
+extern bool   EnableVWAPCheck              = false;
+extern bool   EnableSessionFilter          = true;
+extern bool   EnableNewsWindowBlock        = false;
+//+------------------------------------------------------------------+
+//| INPUTS — RISK / EXECUTION TOGGLES                                |
+//+------------------------------------------------------------------+
+// --- Risk & Execution Toggles ---
+extern bool   EnableRiskGovernor           = true;
+extern bool   EnableDailyDDLock            = true;
+extern bool   EnableWeeklyDDLock           = true;
+extern bool   EnableConsecutiveLossLock    = true;
+extern bool   EnableSpreadEntryFilter      = true;
+extern bool   EnableSlippageEntryFilter    = true;
+extern bool   EnableOnePositionOnly        = true;
+extern bool   EnableMaxTradesPerSession    = true;
+//+------------------------------------------------------------------+
+//| INPUTS — MDAE FEATURE TOGGLES                                    |
+//+------------------------------------------------------------------+
+// --- MDAE Feature Toggles ---
+extern bool   EnableMDAE                   = true;
+extern bool   EnablePipsPerSecond          = true;
+extern bool   EnableVolumePulse            = true;
+extern bool   EnableBodyExpansion          = true;
+extern bool   EnableTop2BreakoutCheck      = true;
+extern bool   EnableLowVolumeBox           = true;
+extern bool   EnableFibGuidance            = false;
+extern bool   EnableEntropyScoring         = true;
+extern bool   EnablePolicySwitching        = true;
+//+------------------------------------------------------------------+
+//| INPUTS — EXIT / ACTION TOGGLES                                   |
+//+------------------------------------------------------------------+
+// --- Exit & Action Toggles ---
+extern bool   EnablePartialClose           = true;
+extern bool   EnableBreakEven              = true;
+extern bool   EnableATRTrail               = true;
+extern bool   EnableSwingTrail             = true;
+extern bool   EnableFastBankMode           = true;
+extern bool   EnableHybridCloseMode        = true;
+extern bool   EnableInvalidationExit       = true;
+extern bool   EnableTimeStop               = true;
+//+------------------------------------------------------------------+
+//| INPUTS — COMPLIANCE TOGGLES                                      |
+//+------------------------------------------------------------------+
+// --- Compliance Toggles ---
+extern bool   EnforceNoSpreadSlStopMoves   = true;
+extern bool   EnforceNoSlippageStopMoves   = true;
+extern bool   EnableComplianceAuditCounters= true;
+//+------------------------------------------------------------------+
+//| INPUTS — SYMBOL & CORE                                           |
+//+------------------------------------------------------------------+
+// --- Core Settings ---
+extern string InpSymbolName                = "XAUUSD";
+extern int    InpMagicNumber               = 777555;
+extern int    InpExecTF                    = PERIOD_M1;
+extern int    InpContextTF_M5              = PERIOD_M5;
+extern int    InpContextTF_M15             = PERIOD_M15;
+//+------------------------------------------------------------------+
+//| INPUTS — RISK PARAMETERS                                         |
+//+------------------------------------------------------------------+
+// --- Risk Parameters ---
+extern double InpRiskPercent               = 0.5;
+extern double InpMaxDailyDD                = 3.0;
+extern double InpMaxWeeklyDD               = 6.0;
+extern int    InpMaxConsecLosses           = 4;
+extern int    InpMaxTradesPerSession       = 5;
+extern double InpMaxSpreadPoints           = 50.0;
+extern int    InpMaxSlippagePoints         = 30;
+extern int    InpMaxRetries                = 3;
+//+------------------------------------------------------------------+
+//| INPUTS — INDICATOR PERIODS                                       |
+//+------------------------------------------------------------------+
+// --- Indicator Periods ---
+extern int    InpATRPeriod                 = 14;
+extern int    InpADXPeriod                 = 14;
+extern int    InpRSIPeriod                 = 14;
+extern int    InpEMAFast                   = 20;
+extern int    InpEMASlow                   = 50;
+extern int    InpBBPeriod                  = 20;
+extern double InpBBDeviation              = 2.0;
+//+------------------------------------------------------------------+
+//| INPUTS — REGIME THRESHOLDS                                       |
+//+------------------------------------------------------------------+
+// --- Regime Thresholds ---
+extern double InpADXTrendThreshold         = 25.0;
+extern double InpADXWeakThreshold          = 18.0;
+extern double InpBBWidthExpandThreshold    = 0.003;
+extern double InpBBWidthCompressThreshold  = 0.0015;
+extern double InpATRPercentileHigh         = 70.0;
+extern int    InpADXSlopeBars              = 3;
+//+------------------------------------------------------------------+
+//| INPUTS — ENTRY PARAMETERS                                        |
+//+------------------------------------------------------------------+
+// --- Entry Parameters ---
+extern double InpRSIOverbought             = 70.0;
+extern double InpRSIOversold               = 30.0;
+extern double InpMinSetupQuality           = 0.5;
+extern double InpOverextensionATRMult      = 2.5;
+extern double InpMinBodyRatio              = 0.4;
+extern int    InpSessionStartHour          = 7;
+extern int    InpSessionEndHour            = 20;
+//+------------------------------------------------------------------+
+//| INPUTS — POSITION MANAGEMENT                                     |
+//+------------------------------------------------------------------+
+// --- Position Management ---
+extern double InpATRSLMultiplier           = 1.5;
+extern double InpInitialTPMultR            = 2.0;
+extern double InpBETriggerR                = 1.0;
+extern double InpBEBufferPoints            = 10.0;
+extern double InpPartial1Pct               = 30.0;
+extern double InpPartial1TriggerR          = 1.0;
+extern double InpPartial2Pct               = 30.0;
+extern double InpPartial2TriggerR          = 2.0;
+extern int    InpMinBarsBeforeBE           = 3;
+//+------------------------------------------------------------------+
+//| INPUTS — TRAILING                                                |
+//+------------------------------------------------------------------+
+// --- Trailing Parameters ---
+extern double InpATRTrailMultiplier        = 2.0;
+extern int    InpSwingLookback             = 10;
+extern double InpFastBankTriggerR          = 0.5;
+extern double InpFastBankTrailPoints       = 30.0;
+//+------------------------------------------------------------------+
+//| INPUTS — MDAE PARAMETERS                                         |
+//+------------------------------------------------------------------+
+// --- MDAE Parameters ---
+extern int    InpSpeedWindowShort          = 5;
+extern int    InpSpeedWindowLong           = 20;
+extern int    InpVolumeAvgPeriod           = 20;
+extern double InpVolumePulseThreshold      = 1.5;
+extern int    InpTop2Lookback              = 20;
+extern int    InpLowVolBoxPeriod           = 10;
+extern double InpLowVolBoxThreshold        = 0.5;
+extern double InpFibLevel1                 = 1.272;
+extern double InpFibLevel2                 = 1.618;
+extern int    InpMaxPolicySwitches         = 2;
+extern int    InpMaxTradeAgeBars           = 120;
+extern double InpEntropyHighThreshold      = 0.7;
+extern double InpContinuationThreshold     = 0.6;
+extern double InpExhaustionThreshold       = 0.4;
+//+------------------------------------------------------------------+
+//| INPUTS — NEWS WINDOW                                             |
+//+------------------------------------------------------------------+
+// --- News Window ---
+extern int    InpNewsBlockStartHour        = 13;
+extern int    InpNewsBlockStartMin         = 25;
+extern int    InpNewsBlockEndHour          = 13;
+extern int    InpNewsBlockEndMin           = 40;
+//+------------------------------------------------------------------+
+//| MANAGED STATE STRUCTURE                                          |
+//+------------------------------------------------------------------+
+// MT4 limitation: no struct support in older builds, using globals
+int      g_msActive       = 0; // 0=false, 1=true
+int      g_msTicket       = 0;
+int      g_msDirection    = 0; // +1 buy, -1 sell
+double   g_msEntryPrice   = 0;
+double   g_msInitialSL    = 0;
+double   g_msInitialTP    = 0;
+double   g_msInitialVolume= 0;
+double   g_msRiskDistance  = 0;
+double   g_msMFE          = 0;
+double   g_msMAE          = 0;
+double   g_msCurrentR     = 0;
+int      g_msBEApplied    = 0;
+int      g_msPartial1Done = 0;
+int      g_msPartial2Done = 0;
+int      g_msActiveMethod = CM_FIXED;
+int      g_msPolicySwitchCount = 0;
+datetime g_msEntryTime    = 0;
+int      g_msBarsInTrade  = 0;
+double   g_msSpreadAtEntry= 0;
+double   g_msSlippageAtEntry = 0;
+int      g_msComplianceViolations = 0;
+int      g_msStopDueSpread   = 0;
+int      g_msStopDueSlippage = 0;
+//+------------------------------------------------------------------+
+//| GLOBAL STATE                                                     |
+//+------------------------------------------------------------------+
+datetime g_lastBar = 0;
+double   g_startEquity = 0;
+double   g_weekStartEquity = 0;
+int      g_dailyLossCount = 0;
+int      g_weeklyLossCount = 0;
+int      g_dayStamp = 0;
+int      g_weekStamp = 0;
+int      g_sessionTradeCount = 0;
+int      g_sessionDayStamp = 0;
+int      g_logHandle = INVALID_HANDLE;
+int      g_complianceTotalChecks = 0;
+int      g_complianceTotalViolations = 0;
+int      g_currentRegime = REGIME_NO_TRADE;
+double   g_regimeConfidence = 0.0;
+string   g_regimeRejectReason = "";
+// For loss tracking (MT4 has no OnTradeTransaction)
+int      g_lastKnownOrdersTotal = 0;
+int      g_previousClosedCount = 0;
+//+------------------------------------------------------------------+
+//| INITIALIZATION                                                   |
+//+------------------------------------------------------------------+
+int init()
+{
+   if(!EnableEA)
+   {
+      Print("EA is disabled via EnableEA input.");
+      return(INIT_SUCCEEDED);
+   }
+   g_startEquity = AccountEquity();
+   g_weekStartEquity = g_startEquity;
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   g_dayStamp = dt.day_of_year;
+   g_weekStamp = dt.day_of_year / 7;
+   g_sessionDayStamp = g_dayStamp;
+   ResetManagedState();
+   ReconstructOpenPosition();
+   if(EnableLogging)
+   {
+      string logName = InpSymbolName + "_MDAE_Log_" + IntegerToString(InpMagicNumber) + ".csv";
+      g_logHandle = FileOpen(logName, FILE_WRITE|FILE_CSV|FILE_ANSI, ',');
+      if(g_logHandle != INVALID_HANDLE)
+      {
+         FileWrite(g_logHandle, "Timestamp","Symbol","TradeID","Event","Regime","Side",
+                   "CurrentR","Method","Action","ReasonCode","Spread","Volume",
+                   "Entropy","StopDueSpread","StopDueSlippage");
+      }
+   }
+   g_previousClosedCount = CountClosedOrders();
+   Print("XAUUSD Adaptive MDAE EA (MT4) initialized successfully.");
+   return(INIT_SUCCEEDED);
+}
+//+------------------------------------------------------------------+
+//| DEINITIALIZATION                                                 |
+//+------------------------------------------------------------------+
+int deinit()
+{
+   if(g_logHandle != INVALID_HANDLE)
+   {
+      FileClose(g_logHandle);
+      g_logHandle = INVALID_HANDLE;
+   }
+   Print("XAUUSD Adaptive MDAE EA (MT4) deinitialized. Compliance violations: ", g_complianceTotalViolations);
+   return(0);
+}
+//+------------------------------------------------------------------+
+//| ONTICK                                                           |
+//+------------------------------------------------------------------+
+int start()
+{
+   if(!EnableEA) return(0);
+   CheckDayWeekReset();
+   CheckForClosedTrades(); // MT4 substitute for OnTradeTransaction
+   // 1) Manage existing position first
+   if(EnablePositionManagement && g_msActive == 1)
+      ManagePosition();
+   // 2) On new bar, evaluate entries
+   if(NewBar())
+   {
+      if(EnableEntries && g_msActive == 0)
+         EvaluateEntry();
+   }
+   return(0);
+}
+//+------------------------------------------------------------------+
+//| HELPER — NewBar                                                  |
+//+------------------------------------------------------------------+
+bool NewBar()
+{
+   datetime t = iTime(InpSymbolName, InpExecTF, 0);
+   if(t == 0) return(false);
+   if(t != g_lastBar)
+   {
+      g_lastBar = t;
+      return(true);
+   }
+   return(false);
+}
+//+------------------------------------------------------------------+
+//| HELPER — NormalizePrice                                          |
+//+------------------------------------------------------------------+
+double NormPrice(double price)
+{
+   double tickSize = MarketInfo(InpSymbolName, MODE_TICKSIZE);
+   if(tickSize <= 0) tickSize = MarketInfo(InpSymbolName, MODE_POINT);
+   if(tickSize <= 0) return(NormalizeDouble(price, (int)MarketInfo(InpSymbolName, MODE_DIGITS)));
+   return(NormalizeDouble(MathRound(price / tickSize) * tickSize, (int)MarketInfo(InpSymbolName, MODE_DIGITS)));
+}
+//+------------------------------------------------------------------+
+//| HELPER — NormalizeLot                                            |
+//+------------------------------------------------------------------+
+double NormLot(double lots)
+{
+   double minLot  = MarketInfo(InpSymbolName, MODE_MINLOT);
+   double maxLot  = MarketInfo(InpSymbolName, MODE_MAXLOT);
+   double lotStep = MarketInfo(InpSymbolName, MODE_LOTSTEP);
+   if(lotStep <= 0) lotStep = 0.01;
+   lots = MathFloor(lots / lotStep) * lotStep;
+   if(lots < minLot) lots = minLot;
+   if(lots > maxLot) lots = maxLot;
+   return(NormalizeDouble(lots, 2));
+}
+//+------------------------------------------------------------------+
+//| HELPER — Current Spread                                          |
+//+------------------------------------------------------------------+
+double CurrentSpreadPoints()
+{
+   return((double)MarketInfo(InpSymbolName, MODE_SPREAD));
+}
+//+------------------------------------------------------------------+
+//| HELPER — IsOurOrder (find our open order)                        |
+//+------------------------------------------------------------------+
+int FindOurTicket()
+{
+   for(int i = OrdersTotal()-1; i >= 0; i--)
+   {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+      if(OrderSymbol() != InpSymbolName) continue;
+      if(OrderMagicNumber() != InpMagicNumber) continue;
+      if(OrderType() == OP_BUY || OrderType() == OP_SELL)
+         return(OrderTicket());
+   }
+   return(0);
+}
+bool IsOurPositionOpen()
+{
+   return(FindOurTicket() > 0);
+}
+//+------------------------------------------------------------------+
+//| HELPER — Count closed orders (for loss tracking)                 |
+//+------------------------------------------------------------------+
+int CountClosedOrders()
+{
+   int count = 0;
+   for(int i = OrdersHistoryTotal()-1; i >= 0; i--)
+   {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) continue;
+      if(OrderSymbol() != InpSymbolName) continue;
+      if(OrderMagicNumber() != InpMagicNumber) continue;
+      count++;
+   }
+   return(count);
+}
+//+------------------------------------------------------------------+
+//| HELPER — Check for newly closed trades (MT4 OnTradeTransaction)  |
+//+------------------------------------------------------------------+
+void CheckForClosedTrades()
+{
+   int currentClosedCount = CountClosedOrders();
+   if(currentClosedCount <= g_previousClosedCount) return;
+   // Process new closed orders
+   for(int i = OrdersHistoryTotal()-1; i >= 0; i--)
+   {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) continue;
+      if(OrderSymbol() != InpSymbolName) continue;
+      if(OrderMagicNumber() != InpMagicNumber) continue;
+      // Check if this is a full close of our managed position
+      if(g_msActive == 1 && OrderTicket() == g_msTicket)
+      {
+         double profit = OrderProfit() + OrderSwap() + OrderCommission();
+         if(profit < 0)
+         {
+            g_dailyLossCount++;
+            g_weeklyLossCount++;
+         }
+         LogTradeSummary("CLOSED", profit);
+         ResetManagedState();
+         break;
+      }
+   }
+   // Also check if our position still exists
+   if(g_msActive == 1)
+   {
+      int ticket = FindOurTicket();
+      if(ticket == 0)
+      {
+         // Position no longer exists
+         LogTradeSummary("CLOSED_DETECTED", 0);
+         ResetManagedState();
+      }
+   }
+   g_previousClosedCount = currentClosedCount;
+}
+//+------------------------------------------------------------------+
+//| HELPER — Day/Week Reset                                          |
+//+------------------------------------------------------------------+
+void CheckDayWeekReset()
+{
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   int curDay = dt.day_of_year;
+   int curWeek = curDay / 7;
+   if(curDay != g_dayStamp)
+   {
+      g_dayStamp = curDay;
+      g_startEquity = AccountEquity();
+      g_dailyLossCount = 0;
+   }
+   if(curDay != g_sessionDayStamp)
+   {
+      g_sessionDayStamp = curDay;
+      g_sessionTradeCount = 0;
+   }
+   if(curWeek != g_weekStamp)
+   {
+      g_weekStamp = curWeek;
+      g_weekStartEquity = AccountEquity();
+      g_weeklyLossCount = 0;
+   }
+}
+//+------------------------------------------------------------------+
+//| HELPER — Reset Managed State                                     |
+//+------------------------------------------------------------------+
+void ResetManagedState()
+{
+   g_msActive = 0;
+   g_msTicket = 0;
+   g_msDirection = 0;
+   g_msEntryPrice = 0;
+   g_msInitialSL = 0;
+   g_msInitialTP = 0;
+   g_msInitialVolume = 0;
+   g_msRiskDistance = 0;
+   g_msMFE = 0;
+   g_msMAE = 0;
+   g_msCurrentR = 0;
+   g_msBEApplied = 0;
+   g_msPartial1Done = 0;
+   g_msPartial2Done = 0;
+   g_msActiveMethod = CM_FIXED;
+   g_msPolicySwitchCount = 0;
+   g_msEntryTime = 0;
+   g_msBarsInTrade = 0;
+   g_msSpreadAtEntry = 0;
+   g_msSlippageAtEntry = 0;
+   g_msComplianceViolations = 0;
+   g_msStopDueSpread = 0;
+   g_msStopDueSlippage = 0;
+}
+//+------------------------------------------------------------------+
+//| HELPER — Reconstruct Open Position on Restart                    |
+//+------------------------------------------------------------------+
+void ReconstructOpenPosition()
+{
+   int ticket = FindOurTicket();
+   if(ticket == 0) return;
+   if(!OrderSelect(ticket, SELECT_BY_TICKET)) return;
+   g_msActive = 1;
+   g_msTicket = ticket;
+   g_msEntryPrice = OrderOpenPrice();
+   g_msInitialSL = OrderStopLoss();
+   g_msInitialTP = OrderTakeProfit();
+   g_msInitialVolume = OrderLots();
+   g_msEntryTime = OrderOpenTime();
+   g_msDirection = (OrderType() == OP_BUY) ? 1 : -1;
+   g_msRiskDistance = MathAbs(g_msEntryPrice - g_msInitialSL);
+   if(g_msRiskDistance <= 0)
+   {
+      double atr = iATR(InpSymbolName, InpExecTF, InpATRPeriod, 1);
+      g_msRiskDistance = (atr > 0) ? atr * InpATRSLMultiplier : 100 * MarketInfo(InpSymbolName, MODE_POINT);
+   }
+   g_msMFE = 0;
+   g_msMAE = 0;
+   g_msBEApplied = 0;
+   g_msPartial1Done = 0;
+   g_msPartial2Done = 0;
+   g_msActiveMethod = CM_FIXED;
+   g_msPolicySwitchCount = 0;
+   g_msBarsInTrade = 0;
+   g_msComplianceViolations = 0;
+   g_msStopDueSpread = 0;
+   g_msStopDueSlippage = 0;
+   Print("INFO: Reconstructed open position ticket=", ticket, " dir=", g_msDirection, " entry=", g_msEntryPrice);
+   LogDecisionEvent("RECONSTRUCTION", "Reconstructed existing position on restart", 0);
+}
+//+------------------------------------------------------------------+
+//| HELPER — Session Filter                                          |
+//+------------------------------------------------------------------+
+bool IsWithinSession()
+{
+   if(!EnableSessionFilter) return(true);
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   return(dt.hour >= InpSessionStartHour && dt.hour < InpSessionEndHour);
+}
+//+------------------------------------------------------------------+
+//| HELPER — News Window Block                                       |
+//+------------------------------------------------------------------+
+bool IsNewsBlocked()
+{
+   if(!EnableNewsWindowBlock) return(false);
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   int nowMin = dt.hour * 60 + dt.min;
+   int startMin = InpNewsBlockStartHour * 60 + InpNewsBlockStartMin;
+   int endMin   = InpNewsBlockEndHour * 60 + InpNewsBlockEndMin;
+   return(nowMin >= startMin && nowMin <= endMin);
+}
+//+------------------------------------------------------------------+
+//| RISK GOVERNOR — RiskCheck                                        |
+//+------------------------------------------------------------------+
+int RiskCheck()
+{
+   if(!EnableRiskGovernor) return(RISK_ALLOW);
+   double equity = AccountEquity();
+   if(EnableDailyDDLock && g_startEquity > 0)
+   {
+      double ddPct = ((g_startEquity - equity) / g_startEquity) * 100.0;
+      if(ddPct >= InpMaxDailyDD)
+      {
+         LogDecisionEvent("RISK_GOVERNOR", "Daily DD lock: " + DoubleToString(ddPct,2) + "%", 0);
+         return(RISK_BLOCK);
+      }
+   }
+   if(EnableWeeklyDDLock && g_weekStartEquity > 0)
+   {
+      double wddPct = ((g_weekStartEquity - equity) / g_weekStartEquity) * 100.0;
+      if(wddPct >= InpMaxWeeklyDD)
+      {
+         LogDecisionEvent("RISK_GOVERNOR", "Weekly DD lock: " + DoubleToString(wddPct,2) + "%", 0);
+         return(RISK_BLOCK);
+      }
+   }
+   if(EnableConsecutiveLossLock && g_dailyLossCount >= InpMaxConsecLosses)
+   {
+      LogDecisionEvent("RISK_GOVERNOR", "Consecutive loss lock: " + IntegerToString(g_dailyLossCount), 0);
+      return(RISK_BLOCK);
+   }
+   if(EnableMaxTradesPerSession && g_sessionTradeCount >= InpMaxTradesPerSession)
+   {
+      LogDecisionEvent("RISK_GOVERNOR", "Max session trades reached", 0);
+      return(RISK_BLOCK);
+   }
+   if(EnableDailyDDLock && g_startEquity > 0)
+   {
+      double ddPct = ((g_startEquity - equity) / g_startEquity) * 100.0;
+      if(ddPct >= InpMaxDailyDD * 0.7)
+         return(RISK_REDUCE);
+   }
+   return(RISK_ALLOW);
+}
+bool IsTradingLocked()
+{
+   return(RiskCheck() == RISK_BLOCK);
+}
+//+------------------------------------------------------------------+
+//| RISK GOVERNOR — CalcLotSizeByRisk                                |
+//+------------------------------------------------------------------+
+double CalcLotSizeByRisk(double slDistancePrice)
+{
+   if(slDistancePrice <= 0) return(MarketInfo(InpSymbolName, MODE_MINLOT));
+   double equity = AccountEquity();
+   double riskPct = InpRiskPercent;
+   int rs = RiskCheck();
+   if(rs == RISK_REDUCE) riskPct *= 0.5;
+   double riskMoney = equity * riskPct / 100.0;
+   double tickValue = MarketInfo(InpSymbolName, MODE_TICKVALUE);
+   double tickSize  = MarketInfo(InpSymbolName, MODE_TICKSIZE);
+   if(tickValue <= 0 || tickSize <= 0) return(MarketInfo(InpSymbolName, MODE_MINLOT));
+   double slTicks = slDistancePrice / tickSize;
+   double lossPerLot = slTicks * tickValue;
+   if(lossPerLot <= 0) return(MarketInfo(InpSymbolName, MODE_MINLOT));
+   double lots = riskMoney / lossPerLot;
+   return(NormLot(lots));
+}
+//+------------------------------------------------------------------+
+//| REGIME ENGINE — DetectRegime                                     |
+//+------------------------------------------------------------------+
+int DetectRegime()
+{
+   if(!EnableRegimeEngine) return(REGIME_TREND_EXPANSION);
+   double adxVal  = iADX(InpSymbolName, InpExecTF, InpADXPeriod, PRICE_CLOSE, MODE_MAIN, 0);
+   double adxPrev = iADX(InpSymbolName, InpExecTF, InpADXPeriod, PRICE_CLOSE, MODE_MAIN, InpADXSlopeBars);
+   double bbUpper  = iBands(InpSymbolName, InpExecTF, InpBBPeriod, InpBBDeviation, 0, PRICE_CLOSE, MODE_UPPER, 0);
+   double bbLower  = iBands(InpSymbolName, InpExecTF, InpBBPeriod, InpBBDeviation, 0, PRICE_CLOSE, MODE_LOWER, 0);
+   double bbMiddle = iBands(InpSymbolName, InpExecTF, InpBBPeriod, InpBBDeviation, 0, PRICE_CLOSE, MODE_MAIN, 0);
+   if(adxVal <= 0 || bbMiddle <= 0)
+   {
+      g_regimeRejectReason = "INDICATOR_FAIL";
+      return(REGIME_NO_TRADE);
+   }
+   double bbWidth = (bbUpper - bbLower) / bbMiddle;
+   double adxSlope = adxVal - adxPrev;
+   bool trendSignal = (adxVal >= InpADXTrendThreshold && adxSlope > 0 && bbWidth >= InpBBWidthExpandThreshold);
+   bool rangeSignal = (adxVal <= InpADXWeakThreshold && bbWidth <= InpBBWidthCompressThreshold);
+   g_regimeConfidence = 0.0;
+   if(trendSignal)
+   {
+      g_regimeConfidence = MathMin(1.0, (adxVal / 50.0) * (bbWidth / InpBBWidthExpandThreshold));
+      g_regimeRejectReason = "";
+      g_currentRegime = REGIME_TREND_EXPANSION;
+      LogDecisionEvent("REGIME", "TREND_EXPANSION ADX=" + DoubleToString(adxVal,1) + " BBW=" + DoubleToString(bbWidth,5), g_regimeConfidence);
+      return(REGIME_TREND_EXPANSION);
+   }
+   else if(rangeSignal)
+   {
+      g_regimeConfidence = MathMin(1.0, (1.0 - adxVal / InpADXTrendThreshold) * (1.0 - bbWidth / InpBBWidthExpandThreshold));
+      g_regimeRejectReason = "";
+      g_currentRegime = REGIME_MEAN_REVERSION;
+      LogDecisionEvent("REGIME", "MEAN_REVERSION ADX=" + DoubleToString(adxVal,1) + " BBW=" + DoubleToString(bbWidth,5), g_regimeConfidence);
+      return(REGIME_MEAN_REVERSION);
+   }
+   else
+   {
+      if(!EnableNoTradeState)
+      {
+         g_currentRegime = REGIME_TREND_EXPANSION;
+         return(REGIME_TREND_EXPANSION);
+      }
+      g_regimeRejectReason = "UNCERTAIN";
+      g_currentRegime = REGIME_NO_TRADE;
+      LogDecisionEvent("REGIME", "NO_TRADE ADX=" + DoubleToString(adxVal,1) + " BBW=" + DoubleToString(bbWidth,5), 0);
+      return(REGIME_NO_TRADE);
+   }
+}
+//+------------------------------------------------------------------+
+//| MTF CONTEXT CHECK                                                |
+//+------------------------------------------------------------------+
+int GetMTFDirection()
+{
+   if(!EnableMTFContextCheck) return(0);
+   double emaFast5  = iMA(InpSymbolName, InpContextTF_M5, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double emaSlow5  = iMA(InpSymbolName, InpContextTF_M5, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double emaFast15 = iMA(InpSymbolName, InpContextTF_M15, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double emaSlow15 = iMA(InpSymbolName, InpContextTF_M15, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE, 0);
+   int dir5 = (emaFast5 > emaSlow5) ? 1 : -1;
+   int dir15 = (emaFast15 > emaSlow15) ? 1 : -1;
+   if(dir5 == dir15) return(dir5);
+   return(0);
+}
+//+------------------------------------------------------------------+
+//| SETUP ENGINE — EvaluateTrendEntry                                |
+//+------------------------------------------------------------------+
+int EvaluateTrendEntry(double &quality)
+{
+   quality = 0;
+   if(!EnableTrendModule) return(0);
+   double emaFast = iMA(InpSymbolName, InpExecTF, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double emaSlow = iMA(InpSymbolName, InpExecTF, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double rsi     = iRSI(InpSymbolName, InpExecTF, InpRSIPeriod, PRICE_CLOSE, 0);
+   double atr     = iATR(InpSymbolName, InpExecTF, InpATRPeriod, 0);
+   double close0 = iClose(InpSymbolName, InpExecTF, 0);
+   double close1 = iClose(InpSymbolName, InpExecTF, 1);
+   double close2 = iClose(InpSymbolName, InpExecTF, 2);
+   double open0  = iOpen(InpSymbolName, InpExecTF, 0);
+   if(close0 <= 0 || close1 <= 0 || atr <= 0) return(0);
+   double distFromEMA = MathAbs(close0 - emaFast);
+   if(distFromEMA > InpOverextensionATRMult * atr) return(0);
+   double bodySize = MathAbs(close0 - open0);
+   double candleRange = iHigh(InpSymbolName, InpExecTF, 0) - iLow(InpSymbolName, InpExecTF, 0);
+   if(candleRange > 0 && (bodySize / candleRange) < InpMinBodyRatio) return(0);
+   int mtfDir = GetMTFDirection();
+   // BUY
+   if(emaFast > emaSlow && close0 > emaFast && rsi > 40 && rsi < InpRSIOverbought)
+   {
+      bool pullback = (close1 <= emaFast * 1.001 || close2 <= emaFast * 1.001);
+      if(!pullback) pullback = (iLow(InpSymbolName, InpExecTF, 1) <= emaFast);
+      if(pullback)
+      {
+         if(mtfDir != 0 && mtfDir != 1) return(0);
+         quality = 0.5 + (rsi - 40) / 60.0 * 0.3 + g_regimeConfidence * 0.2;
+         quality = MathMin(1.0, quality);
+         LogDecisionEvent("ENTRY_EVAL", "TREND_BUY quality=" + DoubleToString(quality,2), quality);
+         return(1);
+      }
+   }
+   // SELL
+   if(emaFast < emaSlow && close0 < emaFast && rsi < 60 && rsi > InpRSIOversold)
+   {
+      bool pullback = (close1 >= emaFast * 0.999 || close2 >= emaFast * 0.999);
+      if(!pullback) pullback = (iHigh(InpSymbolName, InpExecTF, 1) >= emaFast);
+      if(pullback)
+      {
+         if(mtfDir != 0 && mtfDir != -1) return(0);
+         quality = 0.5 + (60 - rsi) / 60.0 * 0.3 + g_regimeConfidence * 0.2;
+         quality = MathMin(1.0, quality);
+         LogDecisionEvent("ENTRY_EVAL", "TREND_SELL quality=" + DoubleToString(quality,2), quality);
+         return(-1);
+      }
+   }
+   return(0);
+}
+//+------------------------------------------------------------------+
+//| SETUP ENGINE — EvaluateMeanReversionEntry                        |
+//+------------------------------------------------------------------+
+int EvaluateMeanReversionEntry(double &quality)
+{
+   quality = 0;
+   if(!EnableMeanReversionModule) return(0);
+   double bbUpper  = iBands(InpSymbolName, InpExecTF, InpBBPeriod, InpBBDeviation, 0, PRICE_CLOSE, MODE_UPPER, 0);
+   double bbLower  = iBands(InpSymbolName, InpExecTF, InpBBPeriod, InpBBDeviation, 0, PRICE_CLOSE, MODE_LOWER, 0);
+   double bbMiddle = iBands(InpSymbolName, InpExecTF, InpBBPeriod, InpBBDeviation, 0, PRICE_CLOSE, MODE_MAIN, 0);
+   double rsi      = iRSI(InpSymbolName, InpExecTF, InpRSIPeriod, PRICE_CLOSE, 0);
+   double atr      = iATR(InpSymbolName, InpExecTF, InpATRPeriod, 0);
+   double adxVal   = iADX(InpSymbolName, InpExecTF, InpADXPeriod, PRICE_CLOSE, MODE_MAIN, 0);
+   double close0 = iClose(InpSymbolName, InpExecTF, 0);
+   double open0  = iOpen(InpSymbolName, InpExecTF, 0);
+   double low0   = iLow(InpSymbolName, InpExecTF, 0);
+   double high0  = iHigh(InpSymbolName, InpExecTF, 0);
+   if(close0 <= 0 || atr <= 0) return(0);
+   double adxPrev = iADX(InpSymbolName, InpExecTF, InpADXPeriod, PRICE_CLOSE, MODE_MAIN, 3);
+   if(adxVal - adxPrev > 5.0) return(0);
+   double candleRange = high0 - low0;
+   int mtfDir = GetMTFDirection();
+   // BUY
+   if(low0 <= bbLower && close0 > bbLower && rsi < InpRSIOversold + 10)
+   {
+      double clv = (candleRange > 0) ? (close0 - low0) / candleRange : 0.5;
+      if(clv < 0.4) return(0);
+      if(mtfDir != 0 && mtfDir != 1) return(0);
+      quality = 0.5 + (InpRSIOversold + 10 - rsi) / 40.0 * 0.3 + clv * 0.2;
+      quality = MathMin(1.0, quality);
+      LogDecisionEvent("ENTRY_EVAL", "MR_BUY quality=" + DoubleToString(quality,2), quality);
+      return(1);
+   }
+   // SELL
+   if(high0 >= bbUpper && close0 < bbUpper && rsi > InpRSIOverbought - 10)
+   {
+      double clv = (candleRange > 0) ? (high0 - close0) / candleRange : 0.5;
+      if(clv < 0.4) return(0);
+      if(mtfDir != 0 && mtfDir != -1) return(0);
+      quality = 0.5 + (rsi - (InpRSIOverbought - 10)) / 40.0 * 0.3 + clv * 0.2;
+      quality = MathMin(1.0, quality);
+      LogDecisionEvent("ENTRY_EVAL", "MR_SELL quality=" + DoubleToString(quality,2), quality);
+      return(-1);
+   }
+   return(0);
+}
+//+------------------------------------------------------------------+
+//| ENTRY EVALUATION — Main                                          |
+//+------------------------------------------------------------------+
+void EvaluateEntry()
+{
+   if(IsTradingLocked())
+   {
+      LogDecisionEvent("PRECHECK", "Trading locked by RiskGovernor", 0);
+      return;
+   }
+   if(!IsWithinSession()) return;
+   if(IsNewsBlocked())
+   {
+      LogDecisionEvent("PRECHECK", "News window block active", 0);
+      return;
+   }
+   if(EnableSpreadEntryFilter)
+   {
+      double spread = CurrentSpreadPoints();
+      if(spread > InpMaxSpreadPoints)
+      {
+         LogDecisionEvent("PRECHECK", "Spread too high: " + DoubleToString(spread,1), 0);
+         return;
+      }
+   }
+   if(EnableOnePositionOnly && IsOurPositionOpen()) return;
+   int regime = DetectRegime();
+   if(regime == REGIME_NO_TRADE) return;
+   double quality = 0;
+   int side = 0;
+   if(regime == REGIME_TREND_EXPANSION)
+      side = EvaluateTrendEntry(quality);
+   else if(regime == REGIME_MEAN_REVERSION)
+      side = EvaluateMeanReversionEntry(quality);
+   if(side == 0) return;
+   if(quality < InpMinSetupQuality)
+   {
+      LogDecisionEvent("ENTRY_DECISION", "Rejected: quality " + DoubleToString(quality,2) + " < threshold", quality);
+      return;
+   }
+   OpenTrade(side, regime);
+}
+//+------------------------------------------------------------------+
+//| OPEN TRADE                                                       |
+//+------------------------------------------------------------------+
+void OpenTrade(int side, int regime)
+{
+   double atr = iATR(InpSymbolName, InpExecTF, InpATRPeriod, 1);
+   if(atr <= 0)
+   {
+      LogDecisionEvent("ORDER_SUBMIT", "ATR read fail", 0);
+      return;
+   }
+   double ask = MarketInfo(InpSymbolName, MODE_ASK);
+   double bid = MarketInfo(InpSymbolName, MODE_BID);
+   if(ask <= 0 || bid <= 0) return;
+   double slDist = atr * InpATRSLMultiplier;
+   double tpDist = slDist * InpInitialTPMultR;
+   double entryPrice, sl, tp;
+   int orderType;
+   if(side == 1)
+   {
+      entryPrice = ask;
+      sl = NormPrice(entryPrice - slDist);
+      tp = NormPrice(entryPrice + tpDist);
+      orderType = OP_BUY;
+   }
+   else
+   {
+      entryPrice = bid;
+      sl = NormPrice(entryPrice + slDist);
+      tp = NormPrice(entryPrice - tpDist);
+      orderType = OP_SELL;
+   }
+   // Validate stop distance
+   int stopsLevel = (int)MarketInfo(InpSymbolName, MODE_STOPLEVEL);
+   double minStopDist = stopsLevel * MarketInfo(InpSymbolName, MODE_POINT);
+   if(slDist < minStopDist)
+   {
+      slDist = minStopDist * 1.1;
+      if(side == 1) sl = NormPrice(entryPrice - slDist);
+      else          sl = NormPrice(entryPrice + slDist);
+   }
+   double lots = CalcLotSizeByRisk(slDist);
+   // Margin check
+   double marginRequired = lots * MarketInfo(InpSymbolName, MODE_MARGINREQUIRED);
+   if(marginRequired > AccountFreeMargin() * 0.9)
+   {
+      LogDecisionEvent("ORDER_SUBMIT", "Insufficient margin", 0);
+      return;
+   }
+   double spreadAtEntry = CurrentSpreadPoints();
+   string comment = "MDAE";
+   if(regime == REGIME_TREND_EXPANSION) comment = "MDAE_TREND";
+   else if(regime == REGIME_MEAN_REVERSION) comment = "MDAE_MR";
+   int ticket = -1;
+   for(int retry = 0; retry < InpMaxRetries; retry++)
+   {
+      RefreshRates();
+      double price = (side == 1) ? MarketInfo(InpSymbolName, MODE_ASK) : MarketInfo(InpSymbolName, MODE_BID);
+      ticket = OrderSend(InpSymbolName, orderType, lots, price, InpMaxSlippagePoints, sl, tp, comment, InpMagicNumber, 0, (side==1) ? clrGreen : clrRed);
+      if(ticket > 0) break;
+      int err = GetLastError();
+      if(EnableDebugPrints) Print("DEBUG: OrderSend retry ", retry, " err=", err);
+      if(err == ERR_REQUOTE || err == ERR_PRICE_CHANGED || err == ERR_OFF_QUOTES)
+         Sleep(200);
+      else
+         break;
+   }
+   if(ticket > 0)
+   {
+      if(OrderSelect(ticket, SELECT_BY_TICKET))
+      {
+         g_msActive = 1;
+         g_msTicket = ticket;
+         g_msDirection = side;
+         g_msEntryPrice = OrderOpenPrice();
+         g_msInitialSL = sl;
+         g_msInitialTP = tp;
+         g_msInitialVolume = lots;
+         g_msRiskDistance = slDist;
+         g_msMFE = 0;
+         g_msMAE = 0;
+         g_msCurrentR = 0;
+         g_msBEApplied = 0;
+         g_msPartial1Done = 0;
+         g_msPartial2Done = 0;
+         g_msActiveMethod = (regime == REGIME_MEAN_REVERSION) ? CM_FIXED : CM_ATR;
+         g_msPolicySwitchCount = 0;
+         g_msEntryTime = TimeCurrent();
+         g_msBarsInTrade = 0;
+         g_msSpreadAtEntry = spreadAtEntry;
+         g_msSlippageAtEntry = 0;
+         g_msComplianceViolations = 0;
+         g_msStopDueSpread = 0;
+         g_msStopDueSlippage = 0;
+         g_sessionTradeCount++;
+         LogDecisionEvent("ORDER_SUBMIT", "Opened " + ((side==1)?"BUY":"SELL") +
+            " lots=" + DoubleToString(lots,2) +
+            " SL=" + DoubleToString(sl, (int)MarketInfo(InpSymbolName, MODE_DIGITS)) +
+            " TP=" + DoubleToString(tp, (int)MarketInfo(InpSymbolName, MODE_DIGITS)) +
+            " spread=" + DoubleToString(spreadAtEntry,1), 0);
+      }
+   }
+   else
+   {
+      LogDecisionEvent("ORDER_SUBMIT", "FAILED err=" + IntegerToString(GetLastError()), 0);
+   }
+}
+//+------------------------------------------------------------------+
+//| MDAE FEATURES                                                    |
+//+------------------------------------------------------------------+
+// Using parallel arrays instead of struct for MT4 compat
+double g_featSpeedNow = 0;
+double g_featSpeedShort = 0;
+double g_featSpeedLong = 0;
+double g_featAcceleration = 0;
+double g_featVolumePulse = 0;
+double g_featBodyExpansion = 0;
+int    g_featTop2Breakout = 0;
+int    g_featInLowVolBox = 0;
+double g_featFibProximity = 0;
+double g_featEntropyScore = 0;
+double g_featContinuationScore = 0;
+void ComputeMDAEFeatures()
+{
+   g_featSpeedNow = 0; g_featSpeedShort = 0; g_featSpeedLong = 0;
+   g_featAcceleration = 0; g_featVolumePulse = 0; g_featBodyExpansion = 0;
+   g_featTop2Breakout = 0; g_featInLowVolBox = 0; g_featFibProximity = 0;
+   g_featEntropyScore = 0; g_featContinuationScore = 0;
+   double close0 = iClose(InpSymbolName, InpExecTF, 0);
+   if(close0 <= 0) return;
+   // Speed
+   if(EnablePipsPerSecond)
+   {
+      double close1 = iClose(InpSymbolName, InpExecTF, 1);
+      datetime time0 = iTime(InpSymbolName, InpExecTF, 0);
+      datetime time1 = iTime(InpSymbolName, InpExecTF, 1);
+      double dtSec = (double)(time0 - time1);
+      if(dtSec > 0) g_featSpeedNow = MathAbs(close0 - close1) / dtSec;
+      double closeS = iClose(InpSymbolName, InpExecTF, InpSpeedWindowShort);
+      datetime timeS = iTime(InpSymbolName, InpExecTF, InpSpeedWindowShort);
+      double dtS = (double)(time0 - timeS);
+      if(dtS > 0) g_featSpeedShort = MathAbs(close0 - closeS) / dtS;
+      double closeL = iClose(InpSymbolName, InpExecTF, InpSpeedWindowLong);
+      datetime timeL = iTime(InpSymbolName, InpExecTF, InpSpeedWindowLong);
+      double dtL = (double)(time0 - timeL);
+      if(dtL > 0) g_featSpeedLong = MathAbs(close0 - closeL) / dtL;
+      g_featAcceleration = (g_featSpeedLong > 0) ? g_featSpeedShort / g_featSpeedLong : 1.0;
+   }
+   // Volume pulse
+   if(EnableVolumePulse)
+   {
+      double vol0 = (double)iVolume(InpSymbolName, InpExecTF, 0);
+      double volAvg = 0;
+      for(int i = 1; i <= InpVolumeAvgPeriod; i++)
+         volAvg += (double)iVolume(InpSymbolName, InpExecTF, i);
+      volAvg /= InpVolumeAvgPeriod;
+      g_featVolumePulse = (volAvg > 0) ? vol0 / volAvg : 1.0;
+   }
+   // Body expansion
+   if(EnableBodyExpansion)
+   {
+      double body0 = MathAbs(iClose(InpSymbolName, InpExecTF, 0) - iOpen(InpSymbolName, InpExecTF, 0));
+      double body1 = MathAbs(iClose(InpSymbolName, InpExecTF, 1) - iOpen(InpSymbolName, InpExecTF, 1));
+      g_featBodyExpansion = (body1 > 0) ? body0 / body1 : 1.0;
+   }
+   // Top-2 breakout
+   if(EnableTop2BreakoutCheck)
+   {
+      double highest = close0, secondHighest = close0;
+      double lowest = close0, secondLowest = close0;
+      for(int i = 1; i <= InpTop2Lookback; i++)
+      {
+         double h = iHigh(InpSymbolName, InpExecTF, i);
+         double l = iLow(InpSymbolName, InpExecTF, i);
+         if(h > highest) { secondHighest = highest; highest = h; }
+         else if(h > secondHighest) secondHighest = h;
+         if(l < lowest) { secondLowest = lowest; lowest = l; }
+         else if(l < secondLowest) secondLowest = l;
+      }
+      if(g_msDirection == 1) g_featTop2Breakout = (close0 > secondHighest) ? 1 : 0;
+      else                   g_featTop2Breakout = (close0 < secondLowest) ? 1 : 0;
+   }
+   // Low volume box
+   if(EnableLowVolumeBox)
+   {
+      double volAvg = 0;
+      for(int i = 0; i < InpLowVolBoxPeriod; i++)
+         volAvg += (double)iVolume(InpSymbolName, InpExecTF, i);
+      volAvg /= InpLowVolBoxPeriod;
+      double longVolAvg = 0;
+      for(int i = 0; i < InpVolumeAvgPeriod; i++)
+         longVolAvg += (double)iVolume(InpSymbolName, InpExecTF, i);
+      longVolAvg /= InpVolumeAvgPeriod;
+      g_featInLowVolBox = (longVolAvg > 0 && volAvg / longVolAvg < InpLowVolBoxThreshold) ? 1 : 0;
+   }
+   // Fib guidance
+   if(EnableFibGuidance && g_msActive == 1 && g_msRiskDistance > 0)
+   {
+      double progress = g_msCurrentR;
+      g_featFibProximity = 0;
+      if(MathAbs(progress - InpFibLevel1) < 0.1) g_featFibProximity = 0.7;
+      if(MathAbs(progress - InpFibLevel2) < 0.1) g_featFibProximity = 1.0;
+   }
+   // Entropy scoring
+   if(EnableEntropyScoring)
+   {
+      double speedSignal = (g_featAcceleration > 1.2) ? 1.0 : (g_featAcceleration < 0.8) ? -1.0 : 0.0;
+      double volSignal   = (g_featVolumePulse > InpVolumePulseThreshold) ? 1.0 : (g_featVolumePulse < 0.7) ? -1.0 : 0.0;
+      double structSignal = (g_featTop2Breakout == 1) ? 1.0 : 0.0;
+      double boxSignal   = (g_featInLowVolBox == 1) ? -1.0 : 0.0;
+      double sum = speedSignal + volSignal + structSignal + boxSignal;
+      double agreement = MathAbs(sum) / 4.0;
+      g_featEntropyScore = 1.0 - agreement;
+      g_featContinuationScore = ((sum > 0 && g_msDirection == 1) || (sum < 0 && g_msDirection == -1)) ?
+                                agreement : (1.0 - agreement) * 0.3;
+   }
+}
+//+------------------------------------------------------------------+
+//| MDAE — SelectCloseMethod                                         |
+//+------------------------------------------------------------------+
+int SelectCloseMethod()
+{
+   if(!EnableMDAE) return(CM_FIXED);
+   if(g_featEntropyScore > InpEntropyHighThreshold && g_featContinuationScore < InpExhaustionThreshold)
+      return(CM_EXIT);
+   if(EnableFastBankMode && g_featInLowVolBox == 1 && g_msCurrentR > InpFastBankTriggerR)
+      return(CM_FAST);
+   if(g_featContinuationScore > InpContinuationThreshold)
+   {
+      if(EnableSwingTrail && g_featTop2Breakout == 1 && g_featVolumePulse > InpVolumePulseThreshold)
+         return(CM_SWING);
+      if(EnableATRTrail)
+         return(CM_ATR);
+   }
+   if(EnableHybridCloseMode && g_featEntropyScore > 0.4 && g_featEntropyScore <= InpEntropyHighThreshold)
+      return(CM_HYBRID);
+   return(CM_FIXED);
+}
+//+------------------------------------------------------------------+
+//| COMPLIANCE — Check Stop Policy                                   |
+//+------------------------------------------------------------------+
+bool ComplianceCheckStopPolicy(double newSL, string reason)
+{
+   if(!EnableComplianceAuditCounters) return(true);
+   g_complianceTotalChecks++;
+   bool violation = false;
+   if(EnforceNoSpreadSlStopMoves && StringFind(reason, "SPREAD_TRIGGER") >= 0)
+   {
+      violation = true;
+      g_msStopDueSpread = 1;
+      LogDecisionEvent("COMPLIANCE", "VIOLATION: Stop due spread: " + reason, 0);
+   }
+   if(EnforceNoSlippageStopMoves && StringFind(reason, "SLIPPAGE_TRIGGER") >= 0)
+   {
+      violation = true;
+      g_msStopDueSlippage = 1;
+      LogDecisionEvent("COMPLIANCE", "VIOLATION: Stop due slippage: " + reason, 0);
+   }
+   if(violation)
+   {
+      g_complianceTotalViolations++;
+      g_msComplianceViolations++;
+      return(false);
+   }
+   return(true);
+}
+//+------------------------------------------------------------------+
+//| POSITION MANAGEMENT — MoveSL                                     |
+//+------------------------------------------------------------------+
+bool MoveSL(double newSL, string reason)
+{
+   if(g_msActive == 0) return(false);
+   if(!OrderSelect(g_msTicket, SELECT_BY_TICKET)) return(false);
+   if(!ComplianceCheckStopPolicy(newSL, reason))
+   {
+      if(EnableDebugPrints) Print("DEBUG: SL move BLOCKED by compliance: ", reason);
+      return(false);
+   }
+   double currentSL = OrderStopLoss();
+   double currentTP = OrderTakeProfit();
+   newSL = NormPrice(newSL);
+   // Don't move SL worse
+   if(g_msDirection == 1 && newSL <= currentSL && currentSL > 0) return(false);
+   if(g_msDirection == -1 && newSL >= currentSL && currentSL > 0) return(false);
+   // Validate stop distance
+   double ask = MarketInfo(InpSymbolName, MODE_ASK);
+   double bid = MarketInfo(InpSymbolName, MODE_BID);
+   int stopsLevel = (int)MarketInfo(InpSymbolName, MODE_STOPLEVEL);
+   int freezeLevel = (int)MarketInfo(InpSymbolName, MODE_FREEZELEVEL);
+   double point = MarketInfo(InpSymbolName, MODE_POINT);
+   double minDist = MathMax((double)stopsLevel, (double)freezeLevel) * point;
+   if(g_msDirection == 1 && bid - newSL < minDist) return(false);
+   if(g_msDirection == -1 && newSL - ask < minDist) return(false);
+   bool result = OrderModify(g_msTicket, OrderOpenPrice(), newSL, currentTP, 0, clrBlue);
+   if(result)
+   {
+      LogDecisionEvent("MANAGEMENT", "SL moved to " + DoubleToString(newSL, (int)MarketInfo(InpSymbolName, MODE_DIGITS)) + " reason=" + reason, g_msCurrentR);
+      return(true);
+   }
+   else
+   {
+      if(EnableDebugPrints) Print("DEBUG: OrderModify failed, err=", GetLastError());
+      return(false);
+   }
+}
+//+------------------------------------------------------------------+
+//| POSITION MANAGEMENT — PartialClose                               |
+//+------------------------------------------------------------------+
+bool PartialClosePercent(double pctOfOriginal, string reason)
+{
+   if(!EnablePartialClose) return(false);
+   if(g_msActive == 0) return(false);
+   if(!OrderSelect(g_msTicket, SELECT_BY_TICKET)) return(false);
+   double currentVol = OrderLots();
+   double closeVol = g_msInitialVolume * pctOfOriginal / 100.0;
+   closeVol = NormLot(closeVol);
+   double minLot = MarketInfo(InpSymbolName, MODE_MINLOT);
+   if(closeVol < minLot)
+   {
+      LogDecisionEvent("MANAGEMENT", "Partial skip: vol " + DoubleToString(closeVol,2) + " < minLot", g_msCurrentR);
+      return(false);
+   }
+   if(closeVol > currentVol) closeVol = currentVol;
+   double remainder = NormLot(currentVol - closeVol);
+   if(remainder > 0 && remainder < minLot)
+      closeVol = currentVol;
+   RefreshRates();
+   double closePrice;
+   if(g_msDirection == 1) closePrice = MarketInfo(InpSymbolName, MODE_BID);
+   else                   closePrice = MarketInfo(InpSymbolName, MODE_ASK);
+   bool result = OrderClose(g_msTicket, closeVol, closePrice, InpMaxSlippagePoints, clrYellow);
+   if(result)
+   {
+      LogDecisionEvent("MANAGEMENT", "Partial " + DoubleToString(pctOfOriginal,0) + "% vol=" + DoubleToString(closeVol,2) + " reason=" + reason, g_msCurrentR);
+      // After partial close in MT4, the remaining position may get a new ticket
+      int newTicket = FindOurTicket();
+      if(newTicket > 0 && newTicket != g_msTicket)
+      {
+         g_msTicket = newTicket;
+         if(EnableDebugPrints) Print("DEBUG: Ticket updated after partial to ", newTicket);
+      }
+      else if(newTicket == 0)
+      {
+         // Fully closed
+         ResetManagedState();
+      }
+   }
+   return(result);
+}
+//+------------------------------------------------------------------+
+//| POSITION MANAGEMENT — ApplyBreakEven                             |
+//+------------------------------------------------------------------+
+void ApplyBreakEven()
+{
+   if(!EnableBreakEven) return;
+   if(g_msBEApplied == 1) return;
+   if(g_msBarsInTrade < InpMinBarsBeforeBE) return;
+   if(g_msCurrentR >= InpBETriggerR)
+   {
+      double bePrice;
+      double point = MarketInfo(InpSymbolName, MODE_POINT);
+      if(g_msDirection == 1) bePrice = g_msEntryPrice + InpBEBufferPoints * point;
+      else                   bePrice = g_msEntryPrice - InpBEBufferPoints * point;
+      if(MoveSL(bePrice, "BREAK_EVEN"))
+      {
+         g_msBEApplied = 1;
+         LogDecisionEvent("MANAGEMENT", "Break-even at " + DoubleToString(g_msCurrentR,2) + "R", g_msCurrentR);
+      }
+   }
+}
+//+------------------------------------------------------------------+
+//| POSITION MANAGEMENT — ApplyPartialClose                          |
+//+------------------------------------------------------------------+
+void ApplyPartialClose()
+{
+   if(!EnablePartialClose) return;
+   if(g_msPartial1Done == 0 && g_msCurrentR >= InpPartial1TriggerR)
+   {
+      if(PartialClosePercent(InpPartial1Pct, "TP1_HIT"))
+         g_msPartial1Done = 1;
+   }
+   if(g_msPartial2Done == 0 && g_msCurrentR >= InpPartial2TriggerR)
+   {
+      if(PartialClosePercent(InpPartial2Pct, "TP2_HIT"))
+         g_msPartial2Done = 1;
+   }
+}
+//+------------------------------------------------------------------+
+//| POSITION MANAGEMENT — ApplyTrailingLogic                         |
+//+------------------------------------------------------------------+
+void ApplyTrailingLogic()
+{
+   double atr = iATR(InpSymbolName, InpExecTF, InpATRPeriod, 0);
+   if(atr <= 0) return;
+   double ask = MarketInfo(InpSymbolName, MODE_ASK);
+   double bid = MarketInfo(InpSymbolName, MODE_BID);
+   double currentPrice = (g_msDirection == 1) ? bid : ask;
+   double point = MarketInfo(InpSymbolName, MODE_POINT);
+   int method = g_msActiveMethod;
+   // ATR Trail
+   if(method == CM_ATR && EnableATRTrail)
+   {
+      double trailSL;
+      if(g_msDirection == 1) trailSL = currentPrice - atr * InpATRTrailMultiplier;
+      else                   trailSL = currentPrice + atr * InpATRTrailMultiplier;
+      MoveSL(trailSL, "ATR_TRAIL");
+   }
+   // Swing Trail
+   if(method == CM_SWING && EnableSwingTrail)
+   {
+      if(g_msDirection == 1)
+      {
+         double recentSwingLow = iLow(InpSymbolName, InpExecTF, 1);
+         for(int i = 2; i <= MathMin(InpSwingLookback, 5); i++)
+         {
+            double lo = iLow(InpSymbolName, InpExecTF, i);
+            if(lo > recentSwingLow) recentSwingLow = lo;
+         }
+         MoveSL(recentSwingLow - atr * 0.2, "SWING_TRAIL");
+      }
+      else
+      {
+         double recentSwingHigh = iHigh(InpSymbolName, InpExecTF, 1);
+         for(int i = 2; i <= MathMin(InpSwingLookback, 5); i++)
+         {
+            double hi = iHigh(InpSymbolName, InpExecTF, i);
+            if(hi < recentSwingHigh) recentSwingHigh = hi;
+         }
+         MoveSL(recentSwingHigh + atr * 0.2, "SWING_TRAIL");
+      }
+   }
+   // Fast Bank
+   if(method == CM_FAST && EnableFastBankMode)
+   {
+      double trailSL;
+      if(g_msDirection == 1) trailSL = currentPrice - InpFastBankTrailPoints * point;
+      else                   trailSL = currentPrice + InpFastBankTrailPoints * point;
+      MoveSL(trailSL, "FAST_BANK_TRAIL");
+   }
+   // Hybrid
+   if(method == CM_HYBRID && EnableHybridCloseMode)
+   {
+      if(g_msDirection == 1)
+      {
+         double atrSL = currentPrice - atr * InpATRTrailMultiplier;
+         double recentLow = iLow(InpSymbolName, InpExecTF, 1);
+         for(int i = 2; i <= MathMin(InpSwingLookback, 5); i++)
+         {
+            double lo = iLow(InpSymbolName, InpExecTF, i);
+            if(lo > recentLow) recentLow = lo;
+         }
+         double structSL = recentLow - atr * 0.2;
+         MoveSL(MathMax(atrSL, structSL), "HYBRID_TRAIL");
+      }
+      else
+      {
+         double atrSL = currentPrice + atr * InpATRTrailMultiplier;
+         double recentHigh = iHigh(InpSymbolName, InpExecTF, 1);
+         for(int i = 2; i <= MathMin(InpSwingLookback, 5); i++)
+         {
+            double hi = iHigh(InpSymbolName, InpExecTF, i);
+            if(hi < recentHigh) recentHigh = hi;
+         }
+         double structSL = recentHigh + atr * 0.2;
+         MoveSL(MathMin(atrSL, structSL), "HYBRID_TRAIL");
+      }
+   }
+}
+//+------------------------------------------------------------------+
+//| POSITION MANAGEMENT — CheckInvalidationExit                      |
+//+------------------------------------------------------------------+
+bool CheckInvalidationExit()
+{
+   if(!EnableInvalidationExit) return(false);
+   if(g_featContinuationScore < InpExhaustionThreshold && g_featEntropyScore > InpEntropyHighThreshold)
+   {
+      LogDecisionEvent("MANAGEMENT", "Invalidation: High entropy + low continuation", g_msCurrentR);
+      return(true);
+   }
+   if(g_featSpeedShort < g_featSpeedLong * 0.2 && g_featVolumePulse < 0.5 && g_msCurrentR < 0.5)
+   {
+      LogDecisionEvent("MANAGEMENT", "Invalidation: Momentum collapse", g_msCurrentR);
+      return(true);
+   }
+   return(false);
+}
+//+------------------------------------------------------------------+
+//| POSITION MANAGEMENT — CheckTimeStopExit                          |
+//+------------------------------------------------------------------+
+bool CheckTimeStopExit()
+{
+   if(!EnableTimeStop) return(false);
+   if(g_msBarsInTrade >= InpMaxTradeAgeBars && g_msCurrentR < 1.0)
+   {
+      LogDecisionEvent("MANAGEMENT", "Time stop: " + IntegerToString(g_msBarsInTrade) + " bars, R=" + DoubleToString(g_msCurrentR,2), g_msCurrentR);
+      return(true);
+   }
+   return(false);
+}
+//+------------------------------------------------------------------+
+//| POSITION MANAGEMENT — Full Close                                 |
+//+------------------------------------------------------------------+
+void ClosePosition(string reason)
+{
+   if(g_msActive == 0) return;
+   if(!OrderSelect(g_msTicket, SELECT_BY_TICKET)) return;
+   double vol = OrderLots();
+   RefreshRates();
+   double closePrice;
+   if(g_msDirection == 1) closePrice = MarketInfo(InpSymbolName, MODE_BID);
+   else                   closePrice = MarketInfo(InpSymbolName, MODE_ASK);
+   bool result = OrderClose(g_msTicket, vol, closePrice, InpMaxSlippagePoints, clrRed);
+   if(result)
+   {
+      LogDecisionEvent("EXIT", "Full close reason=" + reason, g_msCurrentR);
+   }
+   else
+   {
+      if(EnableDebugPrints) Print("DEBUG: Close failed, err=", GetLastError());
+   }
+}
+//+------------------------------------------------------------------+
+//| MAIN POSITION MANAGEMENT ENGINE                                  |
+//+------------------------------------------------------------------+
+void ManagePosition()
+{
+   if(g_msActive == 0) return;
+   // Verify position still exists
+   if(!OrderSelect(g_msTicket, SELECT_BY_TICKET) || OrderCloseTime() > 0)
+   {
+      int newTicket = FindOurTicket();
+      if(newTicket > 0)
+      {
+         g_msTicket = newTicket;
+      }
+      else
+      {
+         ResetManagedState();
+         return;
+      }
+   }
+   // Update live metrics
+   double currentPrice;
+   if(g_msDirection == 1) currentPrice = MarketInfo(InpSymbolName, MODE_BID);
+   else                   currentPrice = MarketInfo(InpSymbolName, MODE_ASK);
+   double pnlPrice = (currentPrice - g_msEntryPrice) * g_msDirection;
+   g_msCurrentR = (g_msRiskDistance > 0) ? pnlPrice / g_msRiskDistance : 0;
+   if(pnlPrice > g_msMFE) g_msMFE = pnlPrice;
+   if(pnlPrice < g_msMAE) g_msMAE = pnlPrice;
+   // Update bars in trade
+   datetime curBarTime = iTime(InpSymbolName, InpExecTF, 0);
+   if(curBarTime > 0 && g_msEntryTime > 0)
+      g_msBarsInTrade = (int)((curBarTime - g_msEntryTime) / PeriodSeconds(InpExecTF));
+   // Compute MDAE features
+   ComputeMDAEFeatures();
+   // Method selection with bounded switching
+   if(EnableMDAE && EnablePolicySwitching)
+   {
+      int desired = SelectCloseMethod();
+      if(desired != g_msActiveMethod)
+      {
+         if(g_msPolicySwitchCount < InpMaxPolicySwitches)
+         {
+            LogDecisionEvent("MDAE_METHOD", "Switch method entropy=" + DoubleToString(g_featEntropyScore,2), g_msCurrentR);
+            g_msActiveMethod = desired;
+            g_msPolicySwitchCount++;
+         }
+      }
+   }
+   // 1) Invalidation exit
+   if(CheckInvalidationExit())
+   {
+      ClosePosition("INVALIDATION");
+      return;
+   }
+   // 2) Time stop
+   if(CheckTimeStopExit())
+   {
+      ClosePosition("TIME_STOP");
+      return;
+   }
+   // 3) CM_EXIT method
+   if(g_msActiveMethod == CM_EXIT)
+   {
+      ClosePosition("CM_EXIT");
+      return;
+   }
+   // 4) Partials
+   ApplyPartialClose();
+   // 5) Break-even
+   ApplyBreakEven();
+   // 6) Trailing
+   ApplyTrailingLogic();
+}
+//+------------------------------------------------------------------+
+//| LOGGING — LogDecisionEvent                                       |
+//+------------------------------------------------------------------+
+void LogDecisionEvent(string eventType, string detail, double score)
+{
+   if(!EnableLogging) return;
+   string ts = TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS);
+   double spread = CurrentSpreadPoints();
+   if(g_logHandle != INVALID_HANDLE)
+   {
+      string regimeStr = "NO_TRADE";
+      if(g_currentRegime == REGIME_TREND_EXPANSION) regimeStr = "TREND";
+      else if(g_currentRegime == REGIME_MEAN_REVERSION) regimeStr = "MR";
+      string methodStr = "FIXED";
+      if(g_msActiveMethod == CM_ATR) methodStr = "ATR";
+      else if(g_msActiveMethod == CM_SWING) methodStr = "SWING";
+      else if(g_msActiveMethod == CM_FAST) methodStr = "FAST";
+      else if(g_msActiveMethod == CM_EXIT) methodStr = "EXIT";
+      else if(g_msActiveMethod == CM_HYBRID) methodStr = "HYBRID";
+      FileWrite(g_logHandle, ts, InpSymbolName,
+         (g_msActive == 1 ? IntegerToString(g_msTicket) : "0"),
+         eventType, regimeStr,
+         (g_msActive == 1 ? IntegerToString(g_msDirection) : "0"),
+         DoubleToString(g_msCurrentR, 3),
+         methodStr,
+         detail, "",
+         DoubleToString(spread, 1), "",
+         DoubleToString(score, 3),
+         (g_msStopDueSpread == 1 ? "true" : "false"),
+         (g_msStopDueSlippage == 1 ? "true" : "false"));
+   }
+   if(EnableDebugPrints)
+      Print("[", eventType, "] ", detail, " R=", DoubleToString(g_msCurrentR,2), " spread=", DoubleToString(spread,1));
+}
+//+------------------------------------------------------------------+
+//| LOGGING — LogTradeSummary                                        |
+//+------------------------------------------------------------------+
+void LogTradeSummary(string closeType, double profit)
+{
+   if(!EnableLogging) return;
+   string detail = "CloseType=" + closeType +
+      " Profit=" + DoubleToString(profit, 2) +
+      " MFE=" + DoubleToString((g_msRiskDistance > 0 ? g_msMFE / g_msRiskDistance : 0), 2) + "R" +
+      " MAE=" + DoubleToString((g_msRiskDistance > 0 ? g_msMAE / g_msRiskDistance : 0), 2) + "R" +
+      " Bars=" + IntegerToString(g_msBarsInTrade) +
+      " Switches=" + IntegerToString(g_msPolicySwitchCount) +
+      " CompViolations=" + IntegerToString(g_msComplianceViolations);
+   if(g_logHandle != INVALID_HANDLE)
+   {
+      FileWrite(g_logHandle, TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS),
+         InpSymbolName, IntegerToString(g_msTicket),
+         "EXIT_SUMMARY", "", IntegerToString(g_msDirection),
+         DoubleToString(g_msCurrentR, 3), "",
+         detail, closeType,
+         DoubleToString(CurrentSpreadPoints(), 1), "",
+         "0",
+         (g_msStopDueSpread == 1 ? "true" : "false"),
+         (g_msStopDueSlippage == 1 ? "true" : "false"));
+   }
+   Print("[TRADE_SUMMARY] ", detail);
+}
+//+------------------------------------------------------------------+    
