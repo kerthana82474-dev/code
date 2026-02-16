@@ -6461,10 +6461,7 @@ bool PlacePendingStopOrder(const DecisionResult &decision, string comment, ulong
       request.sl = NormalizeDouble(request.price + decision.slPoints * g_point, g_digits);
       request.tp = NormalizeDouble(request.price - decision.tpPoints * g_point, g_digits);
    }
-    // Trailing-TP primary mode for pending entries as well.
-   if(IsTpModifyEnabled() && INPUT_MODIFY_TRAILING_TP_ON && g_effModifyTrailingTP)
-      request.tp = 0.0;
-
+   
    // V7.31 FIX #4: Broker distance validation for pending stop orders
    double minStopDist = g_stopLevel * g_point;
    double currentMarket = (decision.direction == 1) ? ask : bid;
@@ -6512,6 +6509,11 @@ bool PlacePendingStopOrder(const DecisionResult &decision, string comment, ulong
                " | TP=", DoubleToString(tpPrice, g_digits));
          return false;
       }
+   }
+   if(request.tp <= 0.0)
+   {
+      Print("PENDING STOP REJECTED: TP must be non-zero before activation");
+      return false;
    }
 
    Print("PENDING STOP REQUEST: Type=", EnumToString(request.type),
@@ -6663,8 +6665,12 @@ bool ExecuteOrder(const DecisionResult &decision)
    tp = NormalizeDouble(tp, g_digits);
    price = NormalizeDouble(price, g_digits);
 
-   if(IsTpModifyEnabled() && INPUT_MODIFY_TRAILING_TP_ON && g_effModifyTrailingTP)
-      tp = 0.0;
+   if(tp <= 0.0)
+   {
+      Print("ORDER REJECTED: TP must be non-zero before activation");
+      return false;
+   }
+
 string riskReject = "";
    if(!CheckTotalRiskBudgetForCandidate(decision.direction, decision.lotSize, decision.slPoints, riskReject))
    {
@@ -9964,7 +9970,7 @@ void CheckPositionAgeTimeout()
 //+------------------------------------------------------------------+
 void ManageTrailingTP()
 {
-   if(!IsTpModifyEnabled() || !INPUT_MODIFY_TRAILING_TP_ON)
+  if(!IsTpModifyEnabled() || !INPUT_MODIFY_TRAILING_TP_ON || !INPUT_ENABLE_TRAILING_TP_GAP)
       return;
    if(!g_effModifyTrailingTP)
       return;
@@ -9987,44 +9993,63 @@ void ManageTrailingTP()
       double entry = PositionGetDouble(POSITION_PRICE_OPEN);
       double profitPoints = dir * (current - entry) / _Point;
 
-      bool activationReached = false;
-      if(INPUT_TRAILING_TP_ACTIVATION_MODE == TRAILING_TP_ACTIVATE_BY_TP_PROGRESS)
+      bool activationReached = g_positions[idx].trailingTPActive;
+      if(!activationReached)
       {
-         double tpDistancePoints = MathAbs(tp - entry) / _Point;
-         if(tp > 0.0 && tpDistancePoints > 0.0)
-            activationReached = (((profitPoints / tpDistancePoints) * 100.0) >= INPUT_TRAILING_TP_ACTIVATION_PERCENT);
-         else
+         if(INPUT_TRAILING_TP_ACTIVATION_MODE == TRAILING_TP_ACTIVATE_BY_TP_PROGRESS)
+         {
+            double tpDistancePoints = MathAbs(tp - entry) / _Point;
+            if(tp > 0.0 && tpDistancePoints > 0.0)
+               activationReached = (((profitPoints / tpDistancePoints) * 100.0) >= INPUT_TRAILING_TP_ACTIVATION_PERCENT);
+            else
+               activationReached = (profitPoints >= INPUT_TRAILING_TP_ACTIVATION_POINTS);
+         }
+         else 
+         {
             activationReached = (profitPoints >= INPUT_TRAILING_TP_ACTIVATION_POINTS);
-      }
-      else
-      {
-         activationReached = (profitPoints >= INPUT_TRAILING_TP_ACTIVATION_POINTS);
-      }
-      if(!activationReached) continue;
+       }
+         if(!activationReached) continue;
 
-      g_positions[idx].trailingTPActive = true;
-      g_positions[idx].closePathState = CLOSE_PATH_TRAILING_TP_MODE;
-      if(!g_positions[idx].movedToBreakeven)
-      {
-         MoveToBreakeven(ticket, entry, (int)posType);
-         g_positions[idx].movedToBreakeven = true;
+               g_positions[idx].trailingTPActive = true;
+         g_positions[idx].closePathState = CLOSE_PATH_TRAILING_TP_MODE;
+         if(!g_positions[idx].movedToBreakeven)
+         {
+            MoveToBreakeven(ticket, entry, (int)posType);
+            g_positions[idx].movedToBreakeven = true;
+            if(!PositionSelectByTicket(ticket)) continue;
+            sl = PositionGetDouble(POSITION_SL);
+         }
+
+         if(tp != 0.0)
+         {
+            if(g_trade.PositionModify(ticket, sl, 0.0))
+               tp = 0.0;
+            else
+               continue;
+         }
       }
 
-      double newTP = NormalizeDouble(current + dir * INPUT_TRAILING_TP_GAP_POINTS * _Point, g_digits);
+  double newSL = NormalizeDouble(current - dir * INPUT_TRAILING_TP_GAP_POINTS * _Point, g_digits);
       double stepPrice = INPUT_TRAILING_TP_STEP_POINTS * _Point;
       if(g_positions[idx].lastTrailingTPPrice > 0.0)
       {
-         double advance = MathAbs(newTP - g_positions[idx].lastTrailingTPPrice);
+        double advance = MathAbs(newSL - g_positions[idx].lastTrailingTPPrice);
          if(advance < stepPrice)
             continue;
       }
 
-      bool shouldMove = (tp <= 0.0) ? true : ((dir == 1) ? (newTP > tp) : (newTP < tp));
+       bool shouldMove = (dir == 1) ? (newSL > sl) : (newSL < sl);
       if(!shouldMove) continue;
 
-      if(g_trade.PositionModify(ticket, sl, newTP))
+      double minDist = g_stopLevel * g_point;
+      if(INPUT_MODIFY_BROKER_DISTANCE_GUARD_ON && dir == 1 && (current - newSL) < minDist)
+         continue;
+      if(INPUT_MODIFY_BROKER_DISTANCE_GUARD_ON && dir == -1 && (newSL - current) < minDist)
+         continue;
+
+      if(g_trade.PositionModify(ticket, newSL, 0.0))
       {
-         g_positions[idx].lastTrailingTPPrice = newTP;
+        g_positions[idx].lastTrailingTPPrice = newSL;
          MarkTicketManagedThisTick(ticket);
       }
    }
