@@ -2802,16 +2802,13 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    else
       return;
 
-   if(INPUT_CLOSE_ON_OPPOSITE_SIGNAL)
-   {
-      bool ok = CleanupOppositeExposureForFlip(activatedDirection);
-      Print("FLIP_ON_ACTIVATION: direction=", (activatedDirection == 1 ? "BUY" : "SELL"),
-            " | cleanup=", (ok ? "OK" : "FAILED"),
-            " | deal=", trans.deal,
-            " | order=", trans.order,
-            " | reqAction=", request.action,
-            " | resultRetcode=", result.retcode);
-   }
+   bool ok = CleanupOppositeExposureForFlip(activatedDirection);
+   Print("FLIP_ON_ACTIVATION: direction=", (activatedDirection == 1 ? "BUY" : "SELL"),
+         " | cleanup=", (ok ? "OK" : "FAILED"),
+         " | deal=", trans.deal,
+         " | order=", trans.order,
+         " | reqAction=", request.action,
+         " | resultRetcode=", result.retcode);
 }
 
 //+------------------------------------------------------------------+
@@ -5805,6 +5802,14 @@ bool CheckAllGates(string &rejectReason)
    int currentTotalPositions = CountAllOurPositions();
    if(INPUT_GATE_MAX_POSITIONS_ON && effectiveExposure >= effectiveMaxMain)
    {
+      bool allowFlipReplacement = (INPUT_STRICT_OPPOSITE_FLIP_MODE && INPUT_MAX_CONCURRENT_TRADES == 1 && (openMain > 0 || pendingMain > 0));
+      if(allowFlipReplacement)
+      {
+         if(INPUT_ENABLE_LOGGING)
+            Print("MAX EXPOSURE GATE DEFERRED: strict one-slot mode with existing exposure detected, allowing opposite-flip cleanup path.");
+      }
+      else
+      {
       g_gateDiagnostics.maxPositionsRejects++;
       rejectReason = "Max main exposure reached (openMain=" + IntegerToString(openMain) +
                      " pendingMain=" + IntegerToString(pendingMain) +
@@ -5814,6 +5819,7 @@ bool CheckAllGates(string &rejectReason)
                      " adaptiveCap=" + IntegerToString(adaptiveCap) +
                      " total=" + IntegerToString(currentTotalPositions) + ")";
       return false;
+      }
    }
 
    if(INPUT_GATE_EA_PROTECTION_STATE_ON && g_effGateProtectionBlock && (g_eaState == STATE_EXTREME_RISK || g_eaState == STATE_DRAWDOWN_PROTECT))
@@ -10183,7 +10189,7 @@ void ManageTrailingTP()
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
-      if(ticket == 0 || !IsOurPosition(ticket) || !PositionSelectByTicket(ticket)) continue;
+      if(ticket == 0 || !PositionSelectByTicket(ticket) || !IsOurPosition(ticket)) continue;
       // V7.34 FIX: Removed ShouldSkipStopAdjustmentsForTicket - trailing TP only fires on profitable
       // positions, so the high-spread-loss skip is never applicable.
       // V7.34 FIX: Removed CanAttemptTPModify - exponential backoff from TP failures should not
@@ -10239,6 +10245,11 @@ void ManageTrailingTP()
                            " | threshold=", DoubleToString(INPUT_TRAILING_TP_ACTIVATION_PERCENT, 1),
                            " | tpDist=", DoubleToString(tpDistancePoints, 1));
                }
+            }
+            else if(INPUT_ENABLE_LOGGING)
+            {
+               Print("TRAILING_TP CHECK: ticket=", ticket,
+                     " | mode=TP_PROGRESS skipped because TP is zero. Set a non-zero TP or switch activation mode to PIPS.");
             }
          }
 
