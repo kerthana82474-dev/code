@@ -1417,6 +1417,9 @@ struct EffectiveConfig
 
 EffectiveConfig g_effectiveConfig;
 
+bool ResolveRuntimeToggleDetailed(const string feature, bool legacyFlag, bool newToggle, string &decisionSource);
+
+
 void ResetAdaptiveParamsToDefaults()
 {
    g_adaptive.lotMultiplier = 1.0;
@@ -1433,16 +1436,27 @@ void ResetAdaptiveParamsToDefaults()
 
 bool ResolveRuntimeToggle(bool legacyFlag, bool newToggle)
 {
+   string ignoredSource = "";
+   return ResolveRuntimeToggleDetailed("(legacy-call)", legacyFlag, newToggle, ignoredSource);
+}
+
+bool ResolveRuntimeToggleDetailed(const string feature, bool legacyFlag, bool newToggle, string &decisionSource)
+{
    if(INPUT_TOGGLE_RESOLUTION_MODE == TOGGLE_RESOLUTION_MIGRATION)
    {
       if(INPUT_USE_LEGACY_BEHAVIOR_MAPPING && legacyFlag && !newToggle)
          Print("MIGRATION TOGGLE OVERRIDE: legacy=ON forces effective ON while new=OFF.");
-      return (INPUT_USE_LEGACY_BEHAVIOR_MAPPING ? (legacyFlag || newToggle) : newToggle);
+     bool effective = (INPUT_USE_LEGACY_BEHAVIOR_MAPPING ? (legacyFlag || newToggle) : newToggle);
+      if(INPUT_USE_LEGACY_BEHAVIOR_MAPPING)
+         decisionSource = (legacyFlag && !newToggle) ? "legacy_or_new(legacy_override)" : "legacy_or_new";
+      else
+         decisionSource = "new";
+      return effective;
    }
 
    if(INPUT_TOGGLE_RESOLUTION_MODE == TOGGLE_RESOLUTION_STRICT_NEW && legacyFlag != newToggle)
       Print("STRICT TOGGLE MISMATCH: legacy=", (legacyFlag ? "ON" : "OFF"), " new=", (newToggle ? "ON" : "OFF"), " effective uses NEW toggle.");
-
+decisionSource = "new";
    if(INPUT_FORCE_NEW_TOGGLES_ONLY)
       return newToggle;
    return newToggle;
@@ -1498,6 +1512,9 @@ bool ValidateAndReportEffectiveConfig()
 
 void LogToggleMatrix(const string feature, bool legacyFlag, bool newToggle, bool effective)
 {
+string decisionSource = "new";
+   ResolveRuntimeToggleDetailed(feature, legacyFlag, newToggle, decisionSource);
+   Print("TOGGLE DECIDER: ", feature, " | source=", decisionSource);
    Print("TOGGLE MATRIX: ", feature,
          " | legacy=", (legacyFlag ? "ON" : "OFF"),
          " | new=", (newToggle ? "ON" : "OFF"),
@@ -1510,6 +1527,11 @@ int BuildCanonicalComboSubsets(const string rawCombination, int k, string &subse
 void RebuildDecisionTreeFeatureModule();
 int CountSelectedTreeFeatureMatches(const string rawCombination);
 double GetTreeConfidenceAdjustment(const string rawCombination);
+bool ResolveRuntimeToggleDetailed(const string feature, bool legacyFlag, bool newToggle, string &decisionSource);
+double CalculateTPProgressPercent(int posType, double entryPrice, double currentPrice, double tpPrice);
+void HandleProgressMilestoneActions(ulong ticket, int idx, double progressPct);
+void ProcessProgressMilestoneActions();
+
 
 bool ValidateInputsStrict(string &err)
 {
@@ -2002,13 +2024,19 @@ int OnInit()
    g_effCloseRecoveryTimeout = ResolveRuntimeToggle(false, INPUT_ENABLE_CLOSE_RECOVERY_TIMEOUT);
    g_effClosePositionAgeTimeout = ResolveRuntimeToggle(INPUT_POSITION_AGE_HOURS > 0, INPUT_ENABLE_CLOSE_POSITION_AGE_TIMEOUT);
    g_effCloseHighSpreadProfit = ResolveRuntimeToggle(INPUT_CLOSE_PROFIT_ON_HIGH_SPREAD, INPUT_ENABLE_CLOSE_HIGH_SPREAD_PROFIT);
-   g_effClose50PctDefensive = ResolveRuntimeToggle(INPUT_ENABLE_50PCT_CLOSE, INPUT_ENABLE_CLOSE_50PCT_DEFENSIVE);
-   g_effClosePartialTP = ResolveRuntimeToggle(INPUT_ENABLE_PARTIAL_CLOSE, INPUT_ENABLE_CLOSE_PARTIAL_TP);
-   g_effCloseMultiLevelPartial = ResolveRuntimeToggle(false, INPUT_ENABLE_CLOSE_MULTI_LEVEL_PARTIAL);
-   g_effModifyMoveToBE = ResolveRuntimeToggle(INPUT_MOVE_BE_AFTER_PARTIAL, INPUT_ENABLE_MODIFY_MOVE_TO_BREAKEVEN);
-   g_effModifyTrailingSL = ResolveRuntimeToggle(INPUT_ENABLE_TRAILING, INPUT_ENABLE_MODIFY_TRAILING_SL);
-   g_effModifyTrailingTP = ResolveRuntimeToggle(INPUT_ENABLE_TRAILING_TP, INPUT_ENABLE_MODIFY_TRAILING_TP);
-   g_effModifySkipLossOnHighSpread = ResolveRuntimeToggle(INPUT_KEEP_LOSS_STOPS_ON_HIGH_SPREAD, INPUT_ENABLE_MODIFY_SKIP_LOSS_ON_HIGH_SPREAD);
+   string srcClose50 = "";
+   string srcPartialTP = "";
+   string srcMultiPartial = "";
+   string srcMoveToBE = "";
+   string srcTrailingSL = "";
+   string srcTrailingTP = "";
+   g_effClose50PctDefensive = ResolveRuntimeToggleDetailed("Handle50PercentLotClose", INPUT_ENABLE_50PCT_CLOSE, INPUT_CLOSE_50PCT_DEFENSIVE_ON, srcClose50);
+   g_effClosePartialTP = ResolveRuntimeToggleDetailed("ManagePartialClose", INPUT_ENABLE_PARTIAL_CLOSE, INPUT_CLOSE_PARTIAL_TP_ON, srcPartialTP);
+   g_effCloseMultiLevelPartial = ResolveRuntimeToggleDetailed("HandleMultiLevelPartial", INPUT_ENABLE_CLOSE_MULTI_LEVEL_PARTIAL, INPUT_CLOSE_MULTI_LEVEL_PARTIAL_ON, srcMultiPartial);
+   g_effModifyMoveToBE = ResolveRuntimeToggleDetailed("MoveToBreakeven", INPUT_MOVE_BE_AFTER_PARTIAL, INPUT_MODIFY_BREAKEVEN_ON, srcMoveToBE);
+   g_effModifyTrailingSL = ResolveRuntimeToggleDetailed("ManageTrailingStops", INPUT_ENABLE_TRAILING, INPUT_MODIFY_TRAILING_SL_ON, srcTrailingSL);
+   g_effModifyTrailingTP = ResolveRuntimeToggleDetailed("ManageTrailingTP", INPUT_ENABLE_TRAILING_TP, INPUT_MODIFY_TRAILING_TP_ON, srcTrailingTP);
+      g_effModifySkipLossOnHighSpread = ResolveRuntimeToggle(INPUT_KEEP_LOSS_STOPS_ON_HIGH_SPREAD, INPUT_ENABLE_MODIFY_SKIP_LOSS_ON_HIGH_SPREAD);
 
    LogToggleMatrix("UpdateEAState.ExtremeByThreat", false, INPUT_ENABLE_EXTREME_BY_THREAT, g_effExtremeByThreat);
    LogToggleMatrix("UpdateEAState.ExtremeByDrawdown", false, INPUT_ENABLE_EXTREME_BY_DRAWDOWN, g_effExtremeByDrawdown);
@@ -2025,25 +2053,31 @@ int OnInit()
    LogToggleMatrix("CheckRecoveryTimeouts", false, INPUT_ENABLE_CLOSE_RECOVERY_TIMEOUT, g_effCloseRecoveryTimeout);
    LogToggleMatrix("CheckPositionAgeTimeout", INPUT_POSITION_AGE_HOURS > 0, INPUT_ENABLE_CLOSE_POSITION_AGE_TIMEOUT, g_effClosePositionAgeTimeout);
    LogToggleMatrix("HandleHighSpreadOpenPositions", INPUT_CLOSE_PROFIT_ON_HIGH_SPREAD, INPUT_ENABLE_CLOSE_HIGH_SPREAD_PROFIT, g_effCloseHighSpreadProfit);
-   LogToggleMatrix("Handle50PercentLotClose", INPUT_ENABLE_50PCT_CLOSE, INPUT_ENABLE_CLOSE_50PCT_DEFENSIVE, g_effClose50PctDefensive);
-   LogToggleMatrix("ManagePartialClose", INPUT_ENABLE_PARTIAL_CLOSE, INPUT_ENABLE_CLOSE_PARTIAL_TP, g_effClosePartialTP);
-   LogToggleMatrix("HandleMultiLevelPartial", false, INPUT_ENABLE_CLOSE_MULTI_LEVEL_PARTIAL, g_effCloseMultiLevelPartial);
-   LogToggleMatrix("ManageTrailingStops", INPUT_ENABLE_TRAILING, INPUT_ENABLE_MODIFY_TRAILING_SL, g_effModifyTrailingSL);
-   LogToggleMatrix("ManageTrailingTP", INPUT_ENABLE_TRAILING_TP, INPUT_ENABLE_MODIFY_TRAILING_TP, g_effModifyTrailingTP);
-   LogToggleMatrix("MoveToBreakeven", INPUT_MOVE_BE_AFTER_PARTIAL, INPUT_ENABLE_MODIFY_MOVE_TO_BREAKEVEN, g_effModifyMoveToBE);
-   LogToggleMatrix("ShouldSkipStopAdjustmentsForTicket", INPUT_KEEP_LOSS_STOPS_ON_HIGH_SPREAD, INPUT_ENABLE_MODIFY_SKIP_LOSS_ON_HIGH_SPREAD, g_effModifySkipLossOnHighSpread);
+   LogToggleMatrix("Handle50PercentLotClose", INPUT_ENABLE_50PCT_CLOSE, INPUT_CLOSE_50PCT_DEFENSIVE_ON, g_effClose50PctDefensive);
+   Print("TOGGLE DECISION: Handle50PercentLotClose effective decided by ", srcClose50, " toggle path.");
+   LogToggleMatrix("ManagePartialClose", INPUT_ENABLE_PARTIAL_CLOSE, INPUT_CLOSE_PARTIAL_TP_ON, g_effClosePartialTP);
+   Print("TOGGLE DECISION: ManagePartialClose effective decided by ", srcPartialTP, " toggle path.");
+   LogToggleMatrix("HandleMultiLevelPartial", INPUT_ENABLE_CLOSE_MULTI_LEVEL_PARTIAL, INPUT_CLOSE_MULTI_LEVEL_PARTIAL_ON, g_effCloseMultiLevelPartial);
+   Print("TOGGLE DECISION: HandleMultiLevelPartial effective decided by ", srcMultiPartial, " toggle path.");
+   LogToggleMatrix("ManageTrailingStops", INPUT_ENABLE_TRAILING, INPUT_MODIFY_TRAILING_SL_ON, g_effModifyTrailingSL);
+   Print("TOGGLE DECISION: ManageTrailingStops effective decided by ", srcTrailingSL, " toggle path.");
+   LogToggleMatrix("ManageTrailingTP", INPUT_ENABLE_TRAILING_TP, INPUT_MODIFY_TRAILING_TP_ON, g_effModifyTrailingTP);
+   Print("TOGGLE DECISION: ManageTrailingTP effective decided by ", srcTrailingTP, " toggle path.");
+   LogToggleMatrix("MoveToBreakeven", INPUT_MOVE_BE_AFTER_PARTIAL, INPUT_MODIFY_BREAKEVEN_ON, g_effModifyMoveToBE);
+   Print("TOGGLE DECISION: MoveToBreakeven effective decided by ", srcMoveToBE, " toggle path.");
+     LogToggleMatrix("ShouldSkipStopAdjustmentsForTicket", INPUT_KEEP_LOSS_STOPS_ON_HIGH_SPREAD, INPUT_ENABLE_MODIFY_SKIP_LOSS_ON_HIGH_SPREAD, g_effModifySkipLossOnHighSpread);
 
    if(INPUT_USE_LEGACY_BEHAVIOR_MAPPING && INPUT_TOGGLE_RESOLUTION_MODE == TOGGLE_RESOLUTION_MIGRATION)
    {
       bool legacyOverrideFound = false;
       if((INPUT_POSITION_AGE_HOURS > 0) && !INPUT_ENABLE_CLOSE_POSITION_AGE_TIMEOUT) legacyOverrideFound = true;
       if(INPUT_CLOSE_PROFIT_ON_HIGH_SPREAD && !INPUT_ENABLE_CLOSE_HIGH_SPREAD_PROFIT) legacyOverrideFound = true;
-      if(INPUT_ENABLE_50PCT_CLOSE && !INPUT_ENABLE_CLOSE_50PCT_DEFENSIVE) legacyOverrideFound = true;
-      if(INPUT_ENABLE_PARTIAL_CLOSE && !INPUT_ENABLE_CLOSE_PARTIAL_TP) legacyOverrideFound = true;
-      if(INPUT_MOVE_BE_AFTER_PARTIAL && !INPUT_ENABLE_MODIFY_MOVE_TO_BREAKEVEN) legacyOverrideFound = true;
-      if(INPUT_ENABLE_TRAILING && !INPUT_ENABLE_MODIFY_TRAILING_SL) legacyOverrideFound = true;
-      if(INPUT_ENABLE_TRAILING_TP && !INPUT_ENABLE_MODIFY_TRAILING_TP) legacyOverrideFound = true;
-      if(INPUT_KEEP_LOSS_STOPS_ON_HIGH_SPREAD && !INPUT_ENABLE_MODIFY_SKIP_LOSS_ON_HIGH_SPREAD) legacyOverrideFound = true;
+      if(INPUT_ENABLE_50PCT_CLOSE && !INPUT_CLOSE_50PCT_DEFENSIVE_ON) legacyOverrideFound = true;
+      if(INPUT_ENABLE_PARTIAL_CLOSE && !INPUT_CLOSE_PARTIAL_TP_ON) legacyOverrideFound = true;
+      if(INPUT_MOVE_BE_AFTER_PARTIAL && !INPUT_MODIFY_BREAKEVEN_ON) legacyOverrideFound = true;
+      if(INPUT_ENABLE_TRAILING && !INPUT_MODIFY_TRAILING_SL_ON) legacyOverrideFound = true;
+      if(INPUT_ENABLE_TRAILING_TP && !INPUT_MODIFY_TRAILING_TP_ON) legacyOverrideFound = true;
+            if(INPUT_KEEP_LOSS_STOPS_ON_HIGH_SPREAD && !INPUT_ENABLE_MODIFY_SKIP_LOSS_ON_HIGH_SPREAD) legacyOverrideFound = true;
       if(legacyOverrideFound)
          Print("WARNING: Legacy mapping override active (legacy=true + new=false found). Consider TOGGLE_RESOLUTION_NEW_AUTH.");
    }
@@ -2342,17 +2376,23 @@ void OnTick()
       CheckAdaptiveOptimization();
 
    t0 = GetTickCount();
-   ManageTrailingTP();
+  ProcessProgressMilestoneActions();
+   if(g_effModifyTrailingTP)
+      ManageTrailingTP();
    CheckPositionAgeTimeout();
    CleanupExpiredPendingStopOrders();
-   ManageTrailingStops();
-   ManagePartialClose();
-   for(int i = 0; i < PositionsTotal(); i++)
+    if(g_effModifyTrailingSL)
+      ManageTrailingStops();
+   if(g_effClosePartialTP)
+      ManagePartialClose();
+   if(g_effCloseMultiLevelPartial)
    {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket == 0) continue;
-      if(g_effCloseMultiLevelPartial)
+     for(int i = 0; i < PositionsTotal(); i++)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if(ticket == 0) continue;
          HandleMultiLevelPartial(ticket);
+          }
    }
    if(g_effClose50PctDefensive)
       Handle50PercentLotClose();
@@ -2504,6 +2544,77 @@ void OnTick()
    }
    g_tickMsPersistence = GetTickCount() - t0;
 }
+bool ZeroTPForMainPositionsOppositeToSignal(int direction)
+{
+   bool allModified = true;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket) || !IsOurPosition(ticket))
+         continue;
+
+      string comment = PositionGetString(POSITION_COMMENT);
+      if(StringFind(comment, COMMENT_MAIN_PREFIX) < 0 || !IsMainEntryComment(comment))
+         continue;
+
+      int posType = (int)PositionGetInteger(POSITION_TYPE);
+      int posDir = (posType == POSITION_TYPE_BUY) ? 1 : -1;
+      if(posDir == direction)
+         continue;
+
+      if(!CanModifyPosition(ticket))
+      {
+         Print("FLIP_TP_ZERO SKIP: ticket=", ticket, " | reason=CAN_MODIFY_POSITION_FALSE");
+         continue;
+      }
+      if(!CanAttemptTPModify(ticket))
+      {
+         Print("FLIP_TP_ZERO SKIP: ticket=", ticket, " | reason=TP_MODIFY_BACKOFF_ACTIVE");
+         continue;
+      }
+      if(ShouldSkipStopAdjustmentsForTicket(ticket))
+      {
+         Print("FLIP_TP_ZERO SKIP: ticket=", ticket, " | reason=STOP_ADJUSTMENTS_SUPPRESSED");
+         continue;
+      }
+
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double previousTP = PositionGetDouble(POSITION_TP);
+      if(previousTP == 0.0)
+      {
+         Print("FLIP_TP_ZERO NOOP: ticket=", ticket, " | prevTP=0.0");
+         continue;
+      }
+
+      bool modified = g_trade.PositionModify(ticket, currentSL, 0.0);
+      long retcode = g_trade.ResultRetcode();
+      string retDesc = g_trade.ResultRetcodeDescription();
+      string retComment = g_trade.ResultComment();
+
+      if(modified)
+      {
+         ResetTPFailureTracker(ticket);
+         Print("FLIP_TP_ZERO OK: ticket=", ticket,
+               " | prevTP=", DoubleToString(previousTP, g_digits),
+               " | newTP=0.0",
+               " | retcode=", retcode,
+               " | desc=", retDesc,
+               " | comment=", retComment);
+      }
+      else
+      {
+         RegisterTPModifyFailure(ticket);
+         allModified = false;
+         Print("FLIP_TP_ZERO FAILED: ticket=", ticket,
+               " | prevTP=", DoubleToString(previousTP, g_digits),
+               " | retcode=", retcode,
+               " | desc=", retDesc,
+               " | comment=", retComment);
+      }
+   }
+   return allModified;
+}
+
 
 bool CloseMainPositionsOppositeToSignal(int direction)
 {
@@ -2535,7 +2646,10 @@ bool CloseMainPositionsOppositeToSignal(int direction)
 
       double adverse = (posType == POSITION_TYPE_BUY) ? (entryPrice - currentPrice) : (currentPrice - entryPrice);
       double lossPctToSL = (MathMax(adverse, 0.0) / slDistance) * 100.0;
-      if(lossPctToSL < INPUT_FLIP_CLOSE_MAX_SL_PERCENT)
+       Print("FLIP_CLEANUP DIAG: ticket=", ticket,
+            " | lossPctToSL=", DoubleToString(lossPctToSL, 2),
+            " | threshold=", DoubleToString(INPUT_FLIP_CLOSE_MAX_SL_PERCENT, 2));
+      if(lossPctToSL <= INPUT_FLIP_CLOSE_MAX_SL_PERCENT)
       {
          if(!g_trade.PositionClose(ticket))
          {
@@ -2548,7 +2662,7 @@ bool CloseMainPositionsOppositeToSignal(int direction)
       else
       {
          Print("FLIP_CLEANUP SKIP: ticket=", ticket,
-               " | reason=LOSS_AT_OR_ABOVE_50PCT_SL",
+              " | reason=LOSS_ABOVE_ALLOWED_SL_PERCENT",
                " | lossPctToSL=", DoubleToString(lossPctToSL, 2),
                " | threshold=", DoubleToString(INPUT_FLIP_CLOSE_MAX_SL_PERCENT, 2));
       }
@@ -2620,7 +2734,9 @@ bool CleanupOppositeExposureForFlip(int direction)
          " | openMain=", openMainBefore,
          " | pendingBuy=", pendingBuyBefore,
          " | pendingSell=", pendingSellBefore);
-
+ bool tpZeroOk = ZeroTPForMainPositionsOppositeToSignal(direction); // Always clear opposite TP before close attempts.
+   if(!tpZeroOk)
+      Print("FLIP_CLEANUP WARNING: one or more opposite MAIN TP zeroing attempts failed.");
    if(!CloseMainPositionsOppositeToSignal(direction))
       allOk = false;
 
@@ -6938,9 +7054,11 @@ void TrackNewPosition(ulong positionTicket, const DecisionResult &decision, stri
 //+------------------------------------------------------------------+
 void Handle50PercentLotClose()
 {
+ if(!g_effClose50PctDefensive)
+      return;
    if(!INPUT_ENABLE_LOSS_PARTIAL_CLOSE)
       return;
-   if(!IsCloseEnabled() || !INPUT_CLOSE_50PCT_DEFENSIVE_ON)
+ if(!IsCloseEnabled())
       return;
 
    int effectiveCount = MathMin(g_lossPartsCount, 10);
@@ -7004,11 +7122,131 @@ void Handle50PercentLotClose()
 //+------------------------------------------------------------------+
 //| SECTION 24: PARTIAL CLOSE & TRAILING STOP                        |
 //+------------------------------------------------------------------+
+double CalculateTPProgressPercent(int posType, double entryPrice, double currentPrice, double tpPrice)
+{
+   double tpSpan = 0.0;
+   double moved = 0.0;
+   if(posType == POSITION_TYPE_BUY)
+   {
+      tpSpan = tpPrice - entryPrice;
+      moved = currentPrice - entryPrice;
+   }
+   else
+   {
+      tpSpan = entryPrice - tpPrice;
+      moved = entryPrice - currentPrice;
+   }
+
+   if(tpSpan <= 0.0)
+      return -1.0;
+
+   double progress = (moved / tpSpan) * 100.0;
+   if(progress < 0.0) progress = 0.0;
+   if(progress > 1000.0) progress = 1000.0;
+   return progress;
+}
+
+void HandleProgressMilestoneActions(ulong ticket, int idx, double progressPct)
+{
+   if(ticket == 0 || idx < 0 || idx >= g_positionCount)
+      return;
+   if(!PositionSelectByTicket(ticket) || !g_positions[idx].isActive)
+      return;
+
+   const double milestonePct = 50.0;
+   if(progressPct < milestonePct)
+      return;
+
+   int posType = (int)PositionGetInteger(POSITION_TYPE);
+   double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+   if(!g_positions[idx].movedToBreakeven && g_effModifyMoveToBE)
+   {
+      MoveToBreakeven(ticket, entryPrice, posType);
+      if(PositionSelectByTicket(ticket))
+      {
+         double slAfter = PositionGetDouble(POSITION_SL);
+         bool beReached = (posType == POSITION_TYPE_BUY) ? (slAfter >= entryPrice && slAfter > 0.0)
+                                                      : (slAfter <= entryPrice && slAfter > 0.0);
+         if(beReached)
+            g_positions[idx].movedToBreakeven = true;
+      }
+   }
+
+   if(g_effModifyTrailingTP && IsTpModifyEnabled() && INPUT_ENABLE_TRAILING_TP_GAP &&
+      CanModifyPosition(ticket) && CanAttemptTPModify(ticket) && !ShouldSkipStopAdjustmentsForTicket(ticket) &&
+      PositionSelectByTicket(ticket))
+   {
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double previousTP = PositionGetDouble(POSITION_TP);
+      if(previousTP != 0.0)
+      {
+         bool modified = g_trade.PositionModify(ticket, currentSL, 0.0);
+         if(modified)
+         {
+            ResetTPFailureTracker(ticket);
+            Print("PROGRESS_MILESTONE TP_ZERO OK: ticket=", ticket,
+                  " | progressPct=", DoubleToString(progressPct, 2),
+                  " | prevTP=", DoubleToString(previousTP, g_digits));
+         }
+         else
+         {
+            RegisterTPModifyFailure(ticket);
+            Print("PROGRESS_MILESTONE TP_ZERO FAILED: ticket=", ticket,
+                  " | progressPct=", DoubleToString(progressPct, 2),
+                  " | prevTP=", DoubleToString(previousTP, g_digits),
+                  " | retcode=", g_trade.ResultRetcode(),
+                  " | comment=", g_trade.ResultComment());
+         }
+      }
+   }
+
+   if(g_effModifyTrailingTP && INPUT_ENABLE_TRAILING_TP_GAP && !g_positions[idx].trailingTPActive)
+   {
+      g_positions[idx].trailingTPActive = true;
+      g_positions[idx].closePathState = CLOSE_PATH_TRAILING_TP_MODE;
+      Print("PROGRESS_MILESTONE TRAILING_MODE ENABLED: ticket=", ticket,
+            " | progressPct=", DoubleToString(progressPct, 2),
+            " | milestonePct=", DoubleToString(milestonePct, 2));
+   }
+}
+
+void ProcessProgressMilestoneActions()
+{
+   for(int i = 0; i < g_positionCount; i++)
+   {
+      if(!g_positions[i].isActive)
+         continue;
+
+      ulong ticket = g_positions[i].ticket;
+      if(ticket == 0 || !PositionSelectByTicket(ticket) || !IsOurPosition(ticket))
+         continue;
+      if(g_positions[i].closePathState == CLOSE_PATH_TERMINAL)
+         continue;
+
+      int posType = (int)PositionGetInteger(POSITION_TYPE);
+      double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
+      double tpPrice = PositionGetDouble(POSITION_TP);
+      if(tpPrice == 0.0)
+         continue;
+
+      double progressPct = CalculateTPProgressPercent(posType, entryPrice, currentPrice, tpPrice);
+      if(progressPct < 0.0)
+         continue;
+
+      g_positions[i].highestProfitPctSeen = MathMax(g_positions[i].highestProfitPctSeen, progressPct);
+      HandleProgressMilestoneActions(ticket, i, progressPct);
+   }
+}
+
+
 void ManagePartialClose()
 {
+   if(!g_effClosePartialTP)
+      return;
    if(!INPUT_ENABLE_PROFIT_PARTIAL_CLOSE)
       return;
-   if(!IsCloseEnabled() || !INPUT_CLOSE_PARTIAL_TP_ON)
+   if(!IsCloseEnabled())
       return;
 
    int effectiveCount = MathMin(g_profitPartsCount, 10);
@@ -7061,11 +7299,7 @@ void ManagePartialClose()
             g_positions[i].closePathState = CLOSE_PATH_PROFIT_PARTIAL_STARTED;
             g_positions[i].lastProfitTriggerIndex = level;
             if(level == 0) g_positions[i].partialClosed = true;
-            if(level == 0 && g_effModifyMoveToBE && !g_positions[i].movedToBreakeven)
-            {
-               MoveToBreakeven(ticket, entryPrice, posType);
-               g_positions[i].movedToBreakeven = true;
-            }
+            
             g_positions[i].currentLots = PositionGetDouble(POSITION_VOLUME);
             MarkTicketManagedThisTick(ticket);
             break;
@@ -7077,18 +7311,12 @@ void ManagePartialClose()
 //+------------------------------------------------------------------+
 void MoveToBreakeven(ulong ticket, double entryPrice, int posType)
 {
-   if(!IsStopModifyEnabled() || !INPUT_MODIFY_BREAKEVEN_ON)
-      return;
-   static bool loggedDisabled = false;
+  
    if(!g_effModifyMoveToBE)
-   {
-      if(!loggedDisabled)
-      {
-         Print("BREAKEVEN modify disabled (INPUT_ENABLE_MODIFY_MOVE_TO_BREAKEVEN=OFF)");
-         loggedDisabled = true;
-      }
+  
       return;
-   }
+if(!IsStopModifyEnabled())
+      return;
 
    if(ShouldSkipStopAdjustmentsForTicket(ticket)) return;
    if(!CanModifyPosition(ticket)) return;
@@ -7146,18 +7374,12 @@ void MoveToBreakeven(ulong ticket, double entryPrice, int posType)
 //+------------------------------------------------------------------+
 void ManageTrailingStops()
 {
-   if(!IsStopModifyEnabled() || !INPUT_MODIFY_TRAILING_SL_ON)
-      return;
-   static bool loggedDisabled = false;
+  
    if(!g_effModifyTrailingSL)
-   {
-      if(!loggedDisabled)
-      {
-         Print("TRAILING SL modify disabled (INPUT_ENABLE_MODIFY_TRAILING_SL=OFF or legacy OFF)");
-         loggedDisabled = true;
-      }
+  
       return;
-   }
+   if(!IsStopModifyEnabled())
+      return;
 
    static datetime lastTrailCheck = 0;
    if(TimeCurrent() - lastTrailCheck < 5) return; // throttle to every 5?sec
@@ -9970,11 +10192,11 @@ void CheckPositionAgeTimeout()
 //+------------------------------------------------------------------+
 void ManageTrailingTP()
 {
-  if(!IsTpModifyEnabled() || !INPUT_MODIFY_TRAILING_TP_ON || !INPUT_ENABLE_TRAILING_TP_GAP)
-      return;
+
    if(!g_effModifyTrailingTP)
       return;
-
+         if(!IsTpModifyEnabled() || !INPUT_ENABLE_TRAILING_TP_GAP)
+      return;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
@@ -9987,47 +10209,13 @@ void ManageTrailingTP()
 
       ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
       int dir = (posType == POSITION_TYPE_BUY) ? 1 : -1;
-      double tp = PositionGetDouble(POSITION_TP);
+      
       double sl = PositionGetDouble(POSITION_SL);
       double current = PositionGetDouble(POSITION_PRICE_CURRENT);
-      double entry = PositionGetDouble(POSITION_PRICE_OPEN);
-      double profitPoints = dir * (current - entry) / _Point;
+     
 
-      bool activationReached = g_positions[idx].trailingTPActive;
-      if(!activationReached)
-      {
-         if(INPUT_TRAILING_TP_ACTIVATION_MODE == TRAILING_TP_ACTIVATE_BY_TP_PROGRESS)
-         {
-            double tpDistancePoints = MathAbs(tp - entry) / _Point;
-            if(tp > 0.0 && tpDistancePoints > 0.0)
-               activationReached = (((profitPoints / tpDistancePoints) * 100.0) >= INPUT_TRAILING_TP_ACTIVATION_PERCENT);
-            else
-               activationReached = (profitPoints >= INPUT_TRAILING_TP_ACTIVATION_POINTS);
-         }
-         else 
-         {
-            activationReached = (profitPoints >= INPUT_TRAILING_TP_ACTIVATION_POINTS);
-       }
-         if(!activationReached) continue;
-
-               g_positions[idx].trailingTPActive = true;
-         g_positions[idx].closePathState = CLOSE_PATH_TRAILING_TP_MODE;
-         if(!g_positions[idx].movedToBreakeven)
-         {
-            MoveToBreakeven(ticket, entry, (int)posType);
-            g_positions[idx].movedToBreakeven = true;
-            if(!PositionSelectByTicket(ticket)) continue;
-            sl = PositionGetDouble(POSITION_SL);
-         }
-
-         if(tp != 0.0)
-         {
-            if(g_trade.PositionModify(ticket, sl, 0.0))
-               tp = 0.0;
-            else
-               continue;
-         }
-      }
+     if(!g_positions[idx].trailingTPActive)
+         continue;
 
   double newSL = NormalizeDouble(current - dir * INPUT_TRAILING_TP_GAP_POINTS * _Point, g_digits);
       double stepPrice = INPUT_TRAILING_TP_STEP_POINTS * _Point;
@@ -10049,8 +10237,13 @@ void ManageTrailingTP()
 
       if(g_trade.PositionModify(ticket, newSL, 0.0))
       {
-        g_positions[idx].lastTrailingTPPrice = newSL;
+        ResetTPFailureTracker(ticket);
+         g_positions[idx].lastTrailingTPPrice = newSL;
          MarkTicketManagedThisTick(ticket);
+      }
+       else
+      {
+         RegisterTPModifyFailure(ticket);
       }
    }
 }
@@ -10060,9 +10253,10 @@ void ManageTrailingTP()
 //+------------------------------------------------------------------+
 void HandleMultiLevelPartial(ulong ticket)
 {
-   if(!IsCloseEnabled() || !INPUT_CLOSE_MULTI_LEVEL_PARTIAL_ON)
-      return;
+   
    if(!g_effCloseMultiLevelPartial)
+      return;
+       if(!IsCloseEnabled())
       return;
    if(ticket == 0 || IsTicketManagedThisTick(ticket)) return;
    if(!PositionSelectByTicket(ticket) || !IsOurPosition(ticket)) return;
