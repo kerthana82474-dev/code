@@ -269,7 +269,7 @@ int init()
    MqlDateTime dt;
    TimeCurrent(dt);
    g_dayStamp = dt.day_of_year;
-   g_weekStamp = dt.day_of_year / 7;
+   g_weekStamp = GetWeekStamp(dt);
    g_sessionDayStamp = g_dayStamp;
    ResetManagedState();
    ReconstructOpenPosition();
@@ -439,6 +439,48 @@ void CheckForClosedTrades()
    }
    g_previousClosedCount = currentClosedCount;
 }
+
+int GetWeekStamp(MqlDateTime dt)
+{
+   int dow = dt.day_of_week;
+   if(dow == 0) dow = 7;
+   return dt.year * 1000 + (dt.day_of_year - dow + 10) / 7;
+}
+
+double ComputeVWAP(int bars)
+{
+   double pv = 0.0, vol = 0.0;
+   for(int i=0;i<bars;i++)
+   {
+      double h=iHigh(InpSymbolName, InpExecTF, i), l=iLow(InpSymbolName, InpExecTF, i), c=iClose(InpSymbolName, InpExecTF, i);
+      double tp=(h+l+c)/3.0;
+      double v=(double)iVolume(InpSymbolName, InpExecTF, i);
+      pv += tp*v; vol += v;
+   }
+   if(vol <= 0.0) return iClose(InpSymbolName, InpExecTF, 0);
+   return pv/vol;
+}
+
+bool PassVWAPBias(int side, string stage)
+{
+   if(!EnableVWAPCheck)
+   {
+      LogDecisionEvent(stage, "VWAP check inactive", 0);
+      return true;
+   }
+   double vwap = ComputeVWAP(30);
+   double px = iClose(InpSymbolName, InpExecTF, 0);
+   bool pass = (side > 0) ? (px >= vwap) : (px <= vwap);
+   LogDecisionEvent(stage, "VWAP " + (pass ? "PASS" : "FAIL") + " px=" + DoubleToString(px,Digits) + " vwap=" + DoubleToString(vwap,Digits), 0);
+   return pass;
+}
+
+double EstimateEntrySlippagePoints()
+{
+   RefreshRates();
+   return MathAbs(MarketInfo(InpSymbolName, MODE_ASK) - MarketInfo(InpSymbolName, MODE_BID)) / MarketInfo(InpSymbolName, MODE_POINT);
+}
+
 //+------------------------------------------------------------------+
 //| HELPER — Day/Week Reset                                          |
 //+------------------------------------------------------------------+
@@ -447,12 +489,15 @@ void CheckDayWeekReset()
    MqlDateTime dt;
    TimeCurrent(dt);
    int curDay = dt.day_of_year;
-   int curWeek = curDay / 7;
+   int curWeek = GetWeekStamp(dt);
+   int oldDay = g_dayStamp;
+   int oldWeek = g_weekStamp;
    if(curDay != g_dayStamp)
    {
       g_dayStamp = curDay;
       g_startEquity = AccountEquity();
       g_dailyLossCount = 0;
+      LogDecisionEvent("RESET", "DAY reset " + IntegerToString(oldDay) + " -> " + IntegerToString(curDay), 0);
    }
    if(curDay != g_sessionDayStamp)
    {
@@ -464,6 +509,7 @@ void CheckDayWeekReset()
       g_weekStamp = curWeek;
       g_weekStartEquity = AccountEquity();
       g_weeklyLossCount = 0;
+      LogDecisionEvent("RESET", "WEEK reset " + IntegerToString(oldWeek) + " -> " + IntegerToString(curWeek), 0);
    }
 }
 //+------------------------------------------------------------------+
@@ -718,6 +764,7 @@ int EvaluateTrendEntry(double &quality)
          if(mtfDir != 0 && mtfDir != 1) return(0);
          quality = 0.5 + (rsi - 40) / 60.0 * 0.3 + g_regimeConfidence * 0.2;
          quality = MathMin(1.0, quality);
+         if(!PassVWAPBias(1, "ENTRY_EVAL")) return(0);
          LogDecisionEvent("ENTRY_EVAL", "TREND_BUY quality=" + DoubleToString(quality,2), quality);
          return(1);
       }
@@ -732,6 +779,7 @@ int EvaluateTrendEntry(double &quality)
          if(mtfDir != 0 && mtfDir != -1) return(0);
          quality = 0.5 + (60 - rsi) / 60.0 * 0.3 + g_regimeConfidence * 0.2;
          quality = MathMin(1.0, quality);
+         if(!PassVWAPBias(-1, "ENTRY_EVAL")) return(0);
          LogDecisionEvent("ENTRY_EVAL", "TREND_SELL quality=" + DoubleToString(quality,2), quality);
          return(-1);
       }
@@ -768,6 +816,7 @@ int EvaluateMeanReversionEntry(double &quality)
       if(mtfDir != 0 && mtfDir != 1) return(0);
       quality = 0.5 + (InpRSIOversold + 10 - rsi) / 40.0 * 0.3 + clv * 0.2;
       quality = MathMin(1.0, quality);
+      if(!PassVWAPBias(1, "ENTRY_EVAL")) return(0);
       LogDecisionEvent("ENTRY_EVAL", "MR_BUY quality=" + DoubleToString(quality,2), quality);
       return(1);
    }
@@ -779,6 +828,7 @@ int EvaluateMeanReversionEntry(double &quality)
       if(mtfDir != 0 && mtfDir != -1) return(0);
       quality = 0.5 + (rsi - (InpRSIOverbought - 10)) / 40.0 * 0.3 + clv * 0.2;
       quality = MathMin(1.0, quality);
+      if(!PassVWAPBias(-1, "ENTRY_EVAL")) return(0);
       LogDecisionEvent("ENTRY_EVAL", "MR_SELL quality=" + DoubleToString(quality,2), quality);
       return(-1);
    }
@@ -809,7 +859,25 @@ void EvaluateEntry()
          return;
       }
    }
-   if(EnableOnePositionOnly && IsOurPositionOpen()) return;
+   if(EnableSlippageEntryFilter)
+   {
+      double projSlip = EstimateEntrySlippagePoints();
+      if(projSlip > InpMaxSlippagePoints)
+      {
+         LogDecisionEvent("PRECHECK", "Slippage filter blocked entry: projected=" + DoubleToString(projSlip,1), 0);
+         return;
+      }
+      LogDecisionEvent("PRECHECK", "Slippage filter PASS projected=" + DoubleToString(projSlip,1), 0);
+   }
+   else
+   {
+      LogDecisionEvent("PRECHECK", "Slippage filter inactive", 0);
+   }
+   if(IsOurPositionOpen())
+   {
+      LogDecisionEvent("PRECHECK", "One-position policy active; existing position present", 0);
+      return;
+   }
    int regime = DetectRegime();
    if(regime == REGIME_NO_TRADE) return;
    double quality = 0;
