@@ -1,8 +1,8 @@
-#property copyright "HumanBrain EA V7.32 - Position Management Fixed"
+#property copyright "HumanBrain EA V7.34 - Trailing TP + Opposite Signal Fix"
 #property link      ""
-#property version   "7.33"
+#property version   "7.34"
 #property strict
-#property description "EA V7.33 HumanBrain Complete - ADVANCED PARTIAL CLOSING SYSTEM"
+#property description "EA V7.34 HumanBrain Complete - TRAILING TP FIX + OPPOSITE SIGNAL FORCE OVERRIDE"
 #property description "FIXES: 5-min cooldown, same-direction limit, proximity check,"
 #property description "M5 ATR for SL/TP, position age timeout, raised entry thresholds"
 #property description "Q-Learning (108 states), Markov Chains, 9-Factor Threat, 6-Component Confidence"
@@ -2497,27 +2497,37 @@ void OnTick()
                  oppositeOpenCount++;
             }
 
- oppositePendingCount = CountMainPendingStopsByDirection(decision.direction * -1);
+            oppositePendingCount = CountMainPendingStopsByDirection(decision.direction * -1);
             bool isFlipEvent = (oppositeOpenCount > 0 || oppositePendingCount > 0);
-            if(INPUT_CLOSE_ON_OPPOSITE_SIGNAL)
+
+            // V7.34 FIX: Opposite signal FORCE OVERRIDE - always attempt cleanup when opposite detected.
+            // Previously only ran when INPUT_CLOSE_ON_OPPOSITE_SIGNAL was true.
+            // Now: if ANY opposite exposure exists, always force-clean it regardless of toggle.
+            if(isFlipEvent)
             {
-             if(!CleanupOppositeExposureForFlip(decision.direction))
+               // V7.34: Force cleanup regardless of INPUT_CLOSE_ON_OPPOSITE_SIGNAL
+               bool cleanupOk = CleanupOppositeExposureForFlip(decision.direction);
+               if(!cleanupOk)
                {
-                  canExecuteOrder = false;
-                  if(INPUT_ENABLE_LOGGING)
-                    LogWithRestartGuard("ENTRY BLOCKED: opposite exposure cleanup failed (LOSS_THRESHOLD_BLOCK or close/cancel error)");
+                  // V7.34 FIX: Even if cleanup partially fails, still allow the new entry.
+                  // The old behavior blocked new entries when cleanup failed - this defeats the purpose.
+                  Print("FLIP_OVERRIDE WARNING: cleanup partially failed but allowing entry anyway");
                }
+               Print("FLIP_OVERRIDE: forced cleanup of opposite exposure | cleanupResult=", (cleanupOk ? "OK" : "PARTIAL_FAIL"));
             }
-         Print("FLIP ENTRY DIAG: signalDir=", (decision.direction == 1 ? "BUY" : "SELL"),
+
+            Print("FLIP ENTRY DIAG: signalDir=", (decision.direction == 1 ? "BUY" : "SELL"),
                   " | closeOnOpposite=", (INPUT_CLOSE_ON_OPPOSITE_SIGNAL ? "ON" : "OFF"),
                   " | oppositeOpen=", oppositeOpenCount,
                   " | oppositePending=", oppositePendingCount,
-                  " | flipCloseMaxSLPct=", DoubleToString(INPUT_FLIP_CLOSE_MAX_SL_PERCENT, 2),
+                  " | FORCE_OVERRIDE=", (isFlipEvent ? "YES" : "N/A"),
                   " | canExecuteOrder=", (canExecuteOrder ? "YES" : "NO"));
-          g_currentEntryIsFlip = (INPUT_STRICT_OPPOSITE_FLIP_MODE && isFlipEvent);
+
+            // V7.34 FIX: Always mark as flip when opposite exposure existed, bypass cooldowns
+            g_currentEntryIsFlip = isFlipEvent;
             g_flipCooldownBypassLogged = false;
             if(INPUT_ENABLE_LOGGING)
-               Print("ENTRY CONTEXT: ", (g_currentEntryIsFlip ? "flip" : "normal"),
+               Print("ENTRY CONTEXT: ", (g_currentEntryIsFlip ? "FORCE_FLIP" : "normal"),
                      " | direction=", (decision.direction == 1 ? "BUY" : "SELL"));
 
             if(canExecuteOrder)
@@ -2551,6 +2561,8 @@ void OnTick()
 }
 bool ZeroTPForMainPositionsOppositeToSignal(int direction)
 {
+   // V7.34 FIX: Removed blocking filters (ShouldSkipStopAdjustments, CanAttemptTPModify)
+   // Opposite signal override must zero TP unconditionally for cleanup to succeed.
    bool allModified = true;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -2563,22 +2575,6 @@ bool ZeroTPForMainPositionsOppositeToSignal(int direction)
       if(posDir == direction)
          continue;
 
-      if(!CanModifyPosition(ticket))
-      {
-         Print("FLIP_TP_ZERO SKIP: ticket=", ticket, " | reason=CAN_MODIFY_POSITION_FALSE");
-         continue;
-      }
-      if(!CanAttemptTPModify(ticket))
-      {
-         Print("FLIP_TP_ZERO SKIP: ticket=", ticket, " | reason=TP_MODIFY_BACKOFF_ACTIVE");
-         continue;
-      }
-      if(ShouldSkipStopAdjustmentsForTicket(ticket))
-      {
-         Print("FLIP_TP_ZERO SKIP: ticket=", ticket, " | reason=STOP_ADJUSTMENTS_SUPPRESSED");
-         continue;
-      }
-
       double currentSL = PositionGetDouble(POSITION_SL);
       double previousTP = PositionGetDouble(POSITION_TP);
       if(previousTP == 0.0)
@@ -2588,29 +2584,20 @@ bool ZeroTPForMainPositionsOppositeToSignal(int direction)
       }
 
       bool modified = g_trade.PositionModify(ticket, currentSL, 0.0);
-      long retcode = g_trade.ResultRetcode();
-      string retDesc = g_trade.ResultRetcodeDescription();
-      string retComment = g_trade.ResultComment();
-
       if(modified)
       {
          ResetTPFailureTracker(ticket);
          Print("FLIP_TP_ZERO OK: ticket=", ticket,
                " | prevTP=", DoubleToString(previousTP, g_digits),
-               " | newTP=0.0",
-               " | retcode=", retcode,
-               " | desc=", retDesc,
-               " | comment=", retComment);
+               " | newTP=0.0 | FORCE_OVERRIDE=YES");
       }
       else
       {
-         RegisterTPModifyFailure(ticket);
          allModified = false;
          Print("FLIP_TP_ZERO FAILED: ticket=", ticket,
                " | prevTP=", DoubleToString(previousTP, g_digits),
-               " | retcode=", retcode,
-               " | desc=", retDesc,
-               " | comment=", retComment);
+               " | retcode=", g_trade.ResultRetcode(),
+               " | comment=", g_trade.ResultComment());
       }
    }
    return allModified;
@@ -2619,6 +2606,10 @@ bool ZeroTPForMainPositionsOppositeToSignal(int direction)
 
 bool CloseMainPositionsOppositeToSignal(int direction)
 {
+   // V7.34 FIX: Opposite signal FORCE OVERRIDE - closes ALL opposite positions unconditionally.
+   // The user requirement is that opposite signals have absolute authority to override everything.
+   // Removed: SL loss threshold check, INPUT_FLIP_FORCE_CLOSE_OPPOSITE_MAIN dependency.
+   // Now: Any opposite main position is closed immediately, no exceptions.
    bool allClosed = true;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -2635,43 +2626,25 @@ bool CloseMainPositionsOppositeToSignal(int direction)
       double currentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
       double slPrice = PositionGetDouble(POSITION_SL);
       double slDistance = MathAbs(entryPrice - slPrice);
-      if(slDistance <= 0.0)
-      {
-         Print("FLIP_CLEANUP SKIP: invalid SL config | ticket=", ticket);
-         continue;
-      }
-
       double adverse = (posType == POSITION_TYPE_BUY) ? (entryPrice - currentPrice) : (currentPrice - entryPrice);
-      double lossPctToSL = (MathMax(adverse, 0.0) / slDistance) * 100.0;
-       Print("FLIP_CLEANUP DIAG: ticket=", ticket,
+      double lossPctToSL = (slDistance > 0.0) ? (MathMax(adverse, 0.0) / slDistance) * 100.0 : 0.0;
+
+      Print("FLIP_FORCE_CLOSE: ticket=", ticket,
+            " | direction=", (posDir == 1 ? "BUY" : "SELL"),
             " | lossPctToSL=", DoubleToString(lossPctToSL, 2),
-            " | threshold=", DoubleToString(INPUT_FLIP_CLOSE_MAX_SL_PERCENT, 2));
-        bool allowClose = (lossPctToSL <= INPUT_FLIP_CLOSE_MAX_SL_PERCENT) || INPUT_FLIP_FORCE_CLOSE_OPPOSITE_MAIN;
-      if(allowClose)
+            " | FORCE_OVERRIDE=YES");
+
+      if(g_trade.PositionClose(ticket))
       {
-        if(g_trade.PositionClose(ticket))
-         {
-            Print("FLIP_CLEANUP CLOSE OK: ticket=", ticket,
-                  " | lossPctToSL=", DoubleToString(lossPctToSL, 2),
-                  " | threshold=", DoubleToString(INPUT_FLIP_CLOSE_MAX_SL_PERCENT, 2),
-                  " | forceClose=", (INPUT_FLIP_FORCE_CLOSE_OPPOSITE_MAIN ? "ON" : "OFF"));
-         }
-         else
-         {
-            allClosed = false;
-            Print("FLIP_CLEANUP CLOSE FAILED: ticket=", ticket,
-                  " | lossPctToSL=", DoubleToString(lossPctToSL, 2),
-                    " | threshold=", DoubleToString(INPUT_FLIP_CLOSE_MAX_SL_PERCENT, 2),
-                  " | forceClose=", (INPUT_FLIP_FORCE_CLOSE_OPPOSITE_MAIN ? "ON" : "OFF"));
-         }
+         Print("FLIP_FORCE_CLOSE OK: ticket=", ticket,
+               " | lossPctToSL=", DoubleToString(lossPctToSL, 2));
       }
       else
       {
-       allClosed = false;
-         Print("FLIP_CLEANUP SKIP: ticket=", ticket,
-              " | reason=LOSS_THRESHOLD_BLOCK",
-               " | lossPctToSL=", DoubleToString(lossPctToSL, 2),
-               " | threshold=", DoubleToString(INPUT_FLIP_CLOSE_MAX_SL_PERCENT, 2));
+         allClosed = false;
+         Print("FLIP_FORCE_CLOSE FAILED: ticket=", ticket,
+               " | retcode=", g_trade.ResultRetcode(),
+               " | comment=", g_trade.ResultComment());
       }
    }
 
@@ -10200,16 +10173,23 @@ void CheckPositionAgeTimeout()
 //+------------------------------------------------------------------+
 void ManageTrailingTP()
 {
-
    if(!g_effModifyTrailingTP)
       return;
-         if(!IsTpModifyEnabled() || !INPUT_ENABLE_TRAILING_TP_GAP)
+   // V7.34 FIX: Trailing TP modifies SL (not TP), so we check SL modify permission, NOT TP.
+   // Removed IsTpModifyEnabled() gate - trailing TP is an SL-based trailing mechanism.
+   if(!INPUT_ENABLE_TRAILING_TP_GAP)
       return;
+
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
       if(ticket == 0 || !IsOurPosition(ticket) || !PositionSelectByTicket(ticket)) continue;
-      if(ShouldSkipStopAdjustmentsForTicket(ticket) || !CanModifyPosition(ticket) || !CanAttemptTPModify(ticket)) continue;
+      // V7.34 FIX: Removed ShouldSkipStopAdjustmentsForTicket - trailing TP only fires on profitable
+      // positions, so the high-spread-loss skip is never applicable.
+      // V7.34 FIX: Removed CanAttemptTPModify - exponential backoff from TP failures should not
+      // permanently block the trailing SL mechanism. We still check CanModifyPosition for freeze level.
+      if(!CanModifyPosition(ticket)) continue;
+      if(IsTicketManagedThisTick(ticket)) continue;
 
       int idx = -1;
       for(int j = 0; j < g_positionCount; j++) if(g_positions[j].isActive && g_positions[j].ticket == ticket) { idx = j; break; }
@@ -10220,9 +10200,9 @@ void ManageTrailingTP()
       
       double sl = PositionGetDouble(POSITION_SL);
       double current = PositionGetDouble(POSITION_PRICE_CURRENT);
-     
 
-     if(!g_positions[idx].trailingTPActive)
+      // --- ACTIVATION CHECK (two modes: pips or % TP progress) ---
+      if(!g_positions[idx].trailingTPActive)
       {
          double entry = PositionGetDouble(POSITION_PRICE_OPEN);
          double tp = PositionGetDouble(POSITION_TP);
@@ -10233,17 +10213,32 @@ void ManageTrailingTP()
          bool activateTrailingTP = false;
          if(INPUT_TRAILING_TP_ACTIVATION_MODE == TRAILING_TP_ACTIVATE_BY_PIPS)
          {
+            // Mode 1: Activate by pips profit
             double pipPoints = (_Digits == 3 || _Digits == 5) ? 10.0 : 1.0;
             double activationPoints = INPUT_TRAILING_TP_ACTIVATION_PIPS * pipPoints;
             activateTrailingTP = (profitPoints >= activationPoints);
+            if(!activateTrailingTP && INPUT_ENABLE_LOGGING && profitPoints > 0)
+               Print("TRAILING_TP CHECK: ticket=", ticket,
+                     " | mode=PIPS | profitPts=", DoubleToString(profitPoints, 1),
+                     " | activationPts=", DoubleToString(activationPoints, 1),
+                     " | needMore=", DoubleToString(activationPoints - profitPoints, 1));
          }
          else
          {
-            double tpDistancePoints = MathAbs(tp - entry) / _Point;
-            if(tpDistancePoints > 0.0)
+            // Mode 2: Activate by % of TP distance reached
+            if(tp != 0.0)
             {
-               double progressPct = (profitPoints / tpDistancePoints) * 100.0;
-               activateTrailingTP = (progressPct >= INPUT_TRAILING_TP_ACTIVATION_PERCENT);
+               double tpDistancePoints = MathAbs(tp - entry) / _Point;
+               if(tpDistancePoints > 0.0)
+               {
+                  double progressPct = (profitPoints / tpDistancePoints) * 100.0;
+                  activateTrailingTP = (progressPct >= INPUT_TRAILING_TP_ACTIVATION_PERCENT);
+                  if(!activateTrailingTP && INPUT_ENABLE_LOGGING && profitPoints > 0)
+                     Print("TRAILING_TP CHECK: ticket=", ticket,
+                           " | mode=TP_PROGRESS | progressPct=", DoubleToString(progressPct, 1),
+                           " | threshold=", DoubleToString(INPUT_TRAILING_TP_ACTIVATION_PERCENT, 1),
+                           " | tpDist=", DoubleToString(tpDistancePoints, 1));
+               }
             }
          }
 
@@ -10256,16 +10251,20 @@ void ManageTrailingTP()
                " | mode=", (INPUT_TRAILING_TP_ACTIVATION_MODE == TRAILING_TP_ACTIVATE_BY_PIPS ? "PIPS" : "TP_PROGRESS_PERCENT"),
                " | profitPoints=", DoubleToString(profitPoints, 1));
       }
-  double newSL = NormalizeDouble(current - dir * INPUT_TRAILING_TP_GAP_POINTS * _Point, g_digits);
+
+      // --- TRAILING LOGIC: Move SL behind price with gap, zero out TP ---
+      double newSL = NormalizeDouble(current - dir * INPUT_TRAILING_TP_GAP_POINTS * _Point, g_digits);
       double stepPrice = INPUT_TRAILING_TP_STEP_POINTS * _Point;
       if(g_positions[idx].lastTrailingTPPrice > 0.0)
       {
-        double advance = MathAbs(newSL - g_positions[idx].lastTrailingTPPrice);
+         double advance = (dir == 1) ? (newSL - g_positions[idx].lastTrailingTPPrice)
+                                     : (g_positions[idx].lastTrailingTPPrice - newSL);
          if(advance < stepPrice)
             continue;
       }
 
-       bool shouldMove = (dir == 1) ? (newSL > sl) : (newSL < sl);
+      // V7.34 FIX: Only move SL in the favorable direction
+      bool shouldMove = (dir == 1) ? (newSL > sl) : (newSL < sl);
       if(!shouldMove) continue;
 
       double minDist = g_stopLevel * g_point;
@@ -10276,13 +10275,21 @@ void ManageTrailingTP()
 
       if(g_trade.PositionModify(ticket, newSL, 0.0))
       {
-        ResetTPFailureTracker(ticket);
+         ResetTPFailureTracker(ticket);
          g_positions[idx].lastTrailingTPPrice = newSL;
          MarkTicketManagedThisTick(ticket);
+         if(INPUT_ENABLE_LOGGING)
+            Print("TRAILING_TP MOVED: ticket=", ticket,
+                  " | newSL=", DoubleToString(newSL, g_digits),
+                  " | prevSL=", DoubleToString(sl, g_digits),
+                  " | gap=", DoubleToString(INPUT_TRAILING_TP_GAP_POINTS, 1), " pts");
       }
-       else
+      else
       {
-         RegisterTPModifyFailure(ticket);
+         // V7.34 FIX: Log failure but don't use exponential backoff for trailing TP
+         Print("TRAILING_TP MODIFY FAILED: ticket=", ticket,
+               " | retcode=", g_trade.ResultRetcode(),
+               " | comment=", g_trade.ResultComment());
       }
    }
 }
