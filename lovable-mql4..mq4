@@ -268,7 +268,8 @@ int init()
    g_startEquity = AccountEquity();
    g_weekStartEquity = g_startEquity;
    MqlDateTime dt;
-   TimeCurrent(dt);
+   datetime now = TimeCurrent();
+   TimeToStruct(now, dt);
    g_dayStamp = dt.day_of_year;
    g_weekStamp = GetWeekStamp(dt);
    g_sessionDayStamp = g_dayStamp;
@@ -490,7 +491,8 @@ bool PassVWAPBias(int side, string stage)
 void CheckDayWeekReset()
 {
    MqlDateTime dt;
-   TimeCurrent(dt);
+   datetime now = TimeCurrent();
+   TimeToStruct(now, dt);
    int curDay = dt.day_of_year;
    int curWeek = GetWeekStamp(dt);
    int oldDay = g_dayStamp;
@@ -587,7 +589,8 @@ bool IsWithinSession()
 {
    if(!EnableSessionFilter) return(true);
    MqlDateTime dt;
-   TimeCurrent(dt);
+   datetime now = TimeCurrent();
+   TimeToStruct(now, dt);
    return(dt.hour >= InpSessionStartHour && dt.hour < InpSessionEndHour);
 }
 //+------------------------------------------------------------------+
@@ -597,7 +600,8 @@ bool IsNewsBlocked()
 {
    if(!EnableNewsWindowBlock) return(false);
    MqlDateTime dt;
-   TimeCurrent(dt);
+   datetime now = TimeCurrent();
+   TimeToStruct(now, dt);
    int nowMin = dt.hour * 60 + dt.min;
    int startMin = InpNewsBlockStartHour * 60 + InpNewsBlockStartMin;
    int endMin   = InpNewsBlockEndHour * 60 + InpNewsBlockEndMin;
@@ -676,11 +680,11 @@ double CalcLotSizeByRisk(double slDistancePrice)
 int DetectRegime()
 {
    if(!EnableRegimeEngine) return(REGIME_TREND_EXPANSION);
-   double adxVal  = iADX(InpSymbolName, InpExecTF, InpADXPeriod, PRICE_CLOSE, MODE_MAIN, 0);
-   double adxPrev = iADX(InpSymbolName, InpExecTF, InpADXPeriod, PRICE_CLOSE, MODE_MAIN, InpADXSlopeBars);
-   double bbUpper  = iBands(InpSymbolName, InpExecTF, InpBBPeriod, InpBBDeviation, 0, PRICE_CLOSE, MODE_UPPER, 0);
-   double bbLower  = iBands(InpSymbolName, InpExecTF, InpBBPeriod, InpBBDeviation, 0, PRICE_CLOSE, MODE_LOWER, 0);
-   double bbMiddle = iBands(InpSymbolName, InpExecTF, InpBBPeriod, InpBBDeviation, 0, PRICE_CLOSE, MODE_MAIN, 0);
+   double adxVal  = iADX(InpSymbolName, InpExecTF, InpADXPeriod, PRICE_CLOSE, MODE_MAIN, 1);
+   double adxPrev = iADX(InpSymbolName, InpExecTF, InpADXPeriod, PRICE_CLOSE, MODE_MAIN, 1 + InpADXSlopeBars);
+   double bbUpper  = iBands(InpSymbolName, InpExecTF, InpBBPeriod, InpBBDeviation, 0, PRICE_CLOSE, MODE_UPPER, 1);
+   double bbLower  = iBands(InpSymbolName, InpExecTF, InpBBPeriod, InpBBDeviation, 0, PRICE_CLOSE, MODE_LOWER, 1);
+   double bbMiddle = iBands(InpSymbolName, InpExecTF, InpBBPeriod, InpBBDeviation, 0, PRICE_CLOSE, MODE_MAIN, 1);
    if(adxVal <= 0 || bbMiddle <= 0)
    {
       g_regimeRejectReason = "INDICATOR_FAIL";
@@ -688,13 +692,13 @@ int DetectRegime()
    }
    double bbWidth = (bbUpper - bbLower) / bbMiddle;
    double adxSlope = adxVal - adxPrev;
-   double atrNow = iATR(InpSymbolName, InpExecTF, InpATRPeriod, 0);
+   double atrNow = iATR(InpSymbolName, InpExecTF, InpATRPeriod, 1);
    double atrPercentile = 50.0;
    if(atrNow > 0)
    {
       int histCount = 0;
       int countBelow = 0;
-      for(int i = 0; i < 100; i++)
+      for(int i = 1; i <= 100; i++)
       {
          double atrVal = iATR(InpSymbolName, InpExecTF, InpATRPeriod, i);
          if(atrVal <= 0) continue;
@@ -757,26 +761,26 @@ int EvaluateTrendEntry(double &quality)
 {
    quality = 0;
    if(!EnableTrendModule) return(0);
-   double emaFast = iMA(InpSymbolName, InpExecTF, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE, 0);
-   double emaSlow = iMA(InpSymbolName, InpExecTF, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE, 0);
-   double rsi     = iRSI(InpSymbolName, InpExecTF, InpRSIPeriod, PRICE_CLOSE, 0);
-   double atr     = iATR(InpSymbolName, InpExecTF, InpATRPeriod, 0);
-   double close0 = iClose(InpSymbolName, InpExecTF, 0);
-   double close1 = iClose(InpSymbolName, InpExecTF, 1);
-   double close2 = iClose(InpSymbolName, InpExecTF, 2);
-   double open0  = iOpen(InpSymbolName, InpExecTF, 0);
+   double emaFast = iMA(InpSymbolName, InpExecTF, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE, 1);
+   double emaSlow = iMA(InpSymbolName, InpExecTF, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE, 1);
+   double rsi     = iRSI(InpSymbolName, InpExecTF, InpRSIPeriod, PRICE_CLOSE, 1);
+   double atr     = iATR(InpSymbolName, InpExecTF, InpATRPeriod, 1);
+   double close0 = iClose(InpSymbolName, InpExecTF, 1);
+   double close1 = iClose(InpSymbolName, InpExecTF, 2);
+   double close2 = iClose(InpSymbolName, InpExecTF, 3);
+   double open0  = iOpen(InpSymbolName, InpExecTF, 1);
    if(close0 <= 0 || close1 <= 0 || atr <= 0) return(0);
    double distFromEMA = MathAbs(close0 - emaFast);
    if(distFromEMA > InpOverextensionATRMult * atr) return(0);
    double bodySize = MathAbs(close0 - open0);
-   double candleRange = iHigh(InpSymbolName, InpExecTF, 0) - iLow(InpSymbolName, InpExecTF, 0);
+   double candleRange = iHigh(InpSymbolName, InpExecTF, 1) - iLow(InpSymbolName, InpExecTF, 1);
    if(candleRange > 0 && (bodySize / candleRange) < InpMinBodyRatio) return(0);
    int mtfDir = GetMTFDirection();
    // BUY
    if(emaFast > emaSlow && close0 > emaFast && rsi > 40 && rsi < InpRSIOverbought)
    {
       bool pullback = (close1 <= emaFast * 1.001 || close2 <= emaFast * 1.001);
-      if(!pullback) pullback = (iLow(InpSymbolName, InpExecTF, 1) <= emaFast);
+      if(!pullback) pullback = (iLow(InpSymbolName, InpExecTF, 2) <= emaFast);
       if(pullback)
       {
          if(mtfDir != 0 && mtfDir != 1) return(0);
@@ -791,7 +795,7 @@ int EvaluateTrendEntry(double &quality)
    if(emaFast < emaSlow && close0 < emaFast && rsi < 60 && rsi > InpRSIOversold)
    {
       bool pullback = (close1 >= emaFast * 0.999 || close2 >= emaFast * 0.999);
-      if(!pullback) pullback = (iHigh(InpSymbolName, InpExecTF, 1) >= emaFast);
+      if(!pullback) pullback = (iHigh(InpSymbolName, InpExecTF, 2) >= emaFast);
       if(pullback)
       {
          if(mtfDir != 0 && mtfDir != -1) return(0);
@@ -811,18 +815,18 @@ int EvaluateMeanReversionEntry(double &quality)
 {
    quality = 0;
    if(!EnableMeanReversionModule) return(0);
-   double bbUpper  = iBands(InpSymbolName, InpExecTF, InpBBPeriod, InpBBDeviation, 0, PRICE_CLOSE, MODE_UPPER, 0);
-   double bbLower  = iBands(InpSymbolName, InpExecTF, InpBBPeriod, InpBBDeviation, 0, PRICE_CLOSE, MODE_LOWER, 0);
-   double bbMiddle = iBands(InpSymbolName, InpExecTF, InpBBPeriod, InpBBDeviation, 0, PRICE_CLOSE, MODE_MAIN, 0);
-   double rsi      = iRSI(InpSymbolName, InpExecTF, InpRSIPeriod, PRICE_CLOSE, 0);
-   double atr      = iATR(InpSymbolName, InpExecTF, InpATRPeriod, 0);
-   double adxVal   = iADX(InpSymbolName, InpExecTF, InpADXPeriod, PRICE_CLOSE, MODE_MAIN, 0);
-   double close0 = iClose(InpSymbolName, InpExecTF, 0);
-   double open0  = iOpen(InpSymbolName, InpExecTF, 0);
-   double low0   = iLow(InpSymbolName, InpExecTF, 0);
-   double high0  = iHigh(InpSymbolName, InpExecTF, 0);
-   if(close0 <= 0 || atr <= 0) return(0);
-   double adxPrev = iADX(InpSymbolName, InpExecTF, InpADXPeriod, PRICE_CLOSE, MODE_MAIN, 3);
+   double bbUpper  = iBands(InpSymbolName, InpExecTF, InpBBPeriod, InpBBDeviation, 0, PRICE_CLOSE, MODE_UPPER, 1);
+   double bbLower  = iBands(InpSymbolName, InpExecTF, InpBBPeriod, InpBBDeviation, 0, PRICE_CLOSE, MODE_LOWER, 1);
+   double bbMiddle = iBands(InpSymbolName, InpExecTF, InpBBPeriod, InpBBDeviation, 0, PRICE_CLOSE, MODE_MAIN, 1);
+   double rsi      = iRSI(InpSymbolName, InpExecTF, InpRSIPeriod, PRICE_CLOSE, 1);
+   double atr      = iATR(InpSymbolName, InpExecTF, InpATRPeriod, 1);
+   double adxVal   = iADX(InpSymbolName, InpExecTF, InpADXPeriod, PRICE_CLOSE, MODE_MAIN, 1);
+   double close0 = iClose(InpSymbolName, InpExecTF, 1);
+   double open0  = iOpen(InpSymbolName, InpExecTF, 1);
+   double low0   = iLow(InpSymbolName, InpExecTF, 1);
+   double high0  = iHigh(InpSymbolName, InpExecTF, 1);
+   if(close0 <= 0 || atr <= 0 || bbMiddle <= 0) return(0);
+   double adxPrev = iADX(InpSymbolName, InpExecTF, InpADXPeriod, PRICE_CLOSE, MODE_MAIN, 4);
    if(adxVal - adxPrev > 5.0) return(0);
    double candleRange = high0 - low0;
    int mtfDir = GetMTFDirection();
@@ -877,7 +881,26 @@ void EvaluateEntry()
          return;
       }
    }
-   LogDecisionEvent("PRECHECK", "Slippage precheck disabled (post-fill measurement only)", 0);
+   // Signals are computed from closed candles (shift=1) to avoid look-ahead / unstable-bar noise.
+   if(EnableSlippageEntryFilter)
+   {
+      static double s_prevMid = 0;
+      RefreshRates();
+      double askPx = MarketInfo(InpSymbolName, MODE_ASK);
+      double bidPx = MarketInfo(InpSymbolName, MODE_BID);
+      double point = MarketInfo(InpSymbolName, MODE_POINT);
+      if(askPx > 0 && bidPx > 0 && point > 0)
+      {
+         double mid = (askPx + bidPx) * 0.5;
+         double tickJumpPts = (s_prevMid > 0) ? MathAbs(mid - s_prevMid) / point : 0;
+         s_prevMid = mid;
+         if(tickJumpPts > InpMaxSlippagePoints)
+         {
+            LogDecisionEvent("PRECHECK", "Slippage proxy too high: tick jump=" + DoubleToString(tickJumpPts,1), 0);
+            return;
+         }
+      }
+   }
    if(EnableOnePositionOnly)
    {
       LogDecisionEvent("PRECHECK", "One-position policy active", 0);
@@ -970,6 +993,24 @@ void OpenTrade(int side, int regime)
       if(ticket > 0)
       {
          requestPriceUsed = price;
+         if(!OrderSelect(ticket, SELECT_BY_TICKET))
+         {
+            LogDecisionEvent("ORDER_SUBMIT", "OrderSelect failed after send, retrying", 0);
+            ticket = -1;
+            continue;
+         }
+         double point = MarketInfo(InpSymbolName, MODE_POINT);
+         double fillSlippagePts = (point > 0 && requestPriceUsed > 0) ? MathAbs(OrderOpenPrice() - requestPriceUsed) / point : 0;
+         if(EnableSlippageEntryFilter && fillSlippagePts > InpMaxSlippagePoints)
+         {
+            LogDecisionEvent("ORDER_SUBMIT", "Fill slippage " + DoubleToString(fillSlippagePts,1) + " > max " + IntegerToString(InpMaxSlippagePoints) + ", aborting retry", 0);
+            RefreshRates();
+            double closePrice = (side == 1) ? MarketInfo(InpSymbolName, MODE_BID) : MarketInfo(InpSymbolName, MODE_ASK);
+            OrderClose(ticket, OrderLots(), closePrice, InpMaxSlippagePoints, clrRed);
+            ticket = -1;
+            Sleep(150);
+            continue;
+         }
          break;
       }
       int err = GetLastError();
