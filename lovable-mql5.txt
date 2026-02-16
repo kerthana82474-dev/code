@@ -169,6 +169,7 @@ input int    InpMinBarsBeforeBE           = 3;
 input group "=== Trailing Parameters ==="
 input double InpATRTrailMultiplier        = 2.0;
 input int    InpSwingLookback             = 10;
+input int    InpTrailingStructureLookback = 10;
 input double InpFastBankTriggerR          = 0.5;
 input double InpFastBankTrailPoints       = 30.0;
 //+------------------------------------------------------------------+
@@ -362,7 +363,7 @@ void OnTick()
    // 2) On new bar, evaluate entries
    if(NewBar())
    {
-      if(EnableEntries && !g_ms.active)
+      if(EnableEntries)
          EvaluateEntry();
    }
 }
@@ -394,6 +395,15 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       else if((de == DEAL_ENTRY_IN || de == DEAL_ENTRY_INOUT) && resolvedPositionId > 0)
       {
          RefreshManagedStateFromPosition(resolvedPositionId);
+         double dealPrice = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
+         double intendedPrice = (request.price > 0.0) ? request.price : ((result.price > 0.0) ? result.price : dealPrice);
+         double point = SymbolInfoDouble(InpSymbolName, SYMBOL_POINT);
+         if(point > 0 && intendedPrice > 0.0 && dealPrice > 0.0)
+         {
+            g_ms.lastSlippageAtEntry = MathAbs(dealPrice - intendedPrice) / point;
+            LogDecisionEvent("ORDER_FILL", "POST_FILL_SLIPPAGE points=" + DoubleToString(g_ms.lastSlippageAtEntry,1) +
+               " intended=" + DoubleToString(intendedPrice,_Digits) + " fill=" + DoubleToString(dealPrice,_Digits), 0);
+         }
       }
    }
 }
@@ -488,7 +498,7 @@ ulong GetOurTicket()
 //+------------------------------------------------------------------+
 //| HELPER — Current Spread                                          |
 //+------------------------------------------------------------------+
-double CurrentSpreadPoints()
+double EstimateSpreadPoints()
 {
    return (double)SymbolInfoInteger(InpSymbolName, SYMBOL_SPREAD);
 }
@@ -523,14 +533,6 @@ bool RefreshManagedStateFromPosition(ulong ticket)
    g_ms.direction = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 1 : -1;
    if(g_ms.initialVolume <= 0.0) g_ms.initialVolume = PositionGetDouble(POSITION_VOLUME);
    return true;
-}
-
-double EstimateEntrySlippagePoints(double expectedPrice)
-{
-   MqlTick tick;
-   if(!SymbolInfoTick(InpSymbolName, tick)) return 0.0;
-   double ref = (expectedPrice > 0.0) ? expectedPrice : ((tick.ask + tick.bid) * 0.5);
-   return MathAbs(tick.ask - tick.bid) / SymbolInfoDouble(InpSymbolName, SYMBOL_POINT);
 }
 
 double ComputeVWAP(int bars)
@@ -791,7 +793,7 @@ ENUM_REGIME DetectRegime()
       atrPercentile = (double)countBelow / (double)ArraySize(atrArr) * 100.0;
    }
    // Classification
-   bool trendSignal = (adxVal >= InpADXTrendThreshold && adxSlope > 0 && bbWidth >= InpBBWidthExpandThreshold);
+   bool trendSignal = (adxVal >= InpADXTrendThreshold && adxSlope > 0 && bbWidth >= InpBBWidthExpandThreshold && atrPercentile >= InpATRPercentileHigh);
    bool rangeSignal = (adxVal <= InpADXWeakThreshold && bbWidth <= InpBBWidthCompressThreshold);
    g_regimeConfidence = 0.0;
    if(trendSignal)
@@ -799,7 +801,7 @@ ENUM_REGIME DetectRegime()
       g_regimeConfidence = MathMin(1.0, (adxVal / 50.0) * (bbWidth / InpBBWidthExpandThreshold));
       g_regimeRejectReason = "";
       g_currentRegime = REGIME_TREND_EXPANSION;
-      LogDecisionEvent("REGIME", "TREND_EXPANSION ADX=" + DoubleToString(adxVal,1) + " BBW=" + DoubleToString(bbWidth,5), g_regimeConfidence);
+      LogDecisionEvent("REGIME", "TREND_EXPANSION ADX=" + DoubleToString(adxVal,1) + " BBW=" + DoubleToString(bbWidth,5) + " ATRPct=" + DoubleToString(atrPercentile,1), g_regimeConfidence);
       return REGIME_TREND_EXPANSION;
    }
    else if(rangeSignal)
@@ -807,7 +809,7 @@ ENUM_REGIME DetectRegime()
       g_regimeConfidence = MathMin(1.0, (1.0 - adxVal / InpADXTrendThreshold) * (1.0 - bbWidth / InpBBWidthExpandThreshold));
       g_regimeRejectReason = "";
       g_currentRegime = REGIME_MEAN_REVERSION;
-      LogDecisionEvent("REGIME", "MEAN_REVERSION ADX=" + DoubleToString(adxVal,1) + " BBW=" + DoubleToString(bbWidth,5), g_regimeConfidence);
+      LogDecisionEvent("REGIME", "MEAN_REVERSION ADX=" + DoubleToString(adxVal,1) + " BBW=" + DoubleToString(bbWidth,5) + " ATRPct=" + DoubleToString(atrPercentile,1), g_regimeConfidence);
       return REGIME_MEAN_REVERSION;
    }
    else
@@ -820,7 +822,7 @@ ENUM_REGIME DetectRegime()
       }
       g_regimeRejectReason = "UNCERTAIN";
       g_currentRegime = REGIME_NO_TRADE;
-      LogDecisionEvent("REGIME", "NO_TRADE ADX=" + DoubleToString(adxVal,1) + " BBW=" + DoubleToString(bbWidth,5), 0);
+      LogDecisionEvent("REGIME", "NO_TRADE ADX=" + DoubleToString(adxVal,1) + " BBW=" + DoubleToString(bbWidth,5) + " ATRPct=" + DoubleToString(atrPercentile,1), 0);
       return REGIME_NO_TRADE;
    }
 }
@@ -978,33 +980,26 @@ void EvaluateEntry()
    // Spread entry filter
    if(EnableSpreadEntryFilter)
    {
-      double spread = CurrentSpreadPoints();
+      double spread = EstimateSpreadPoints();
       if(spread > InpMaxSpreadPoints)
       {
          LogDecisionEvent("PRECHECK", "Spread too high: " + DoubleToString(spread,1), 0);
          return;
       }
    }
-   // Slippage entry filter
-   if(EnableSlippageEntryFilter)
+   LogDecisionEvent("PRECHECK", "Slippage precheck disabled (post-fill measurement only)", 0);
+   if(EnableOnePositionOnly)
    {
-      double projSlip = EstimateEntrySlippagePoints(0.0);
-      if(projSlip > InpMaxSlippagePoints)
+      LogDecisionEvent("PRECHECK", "One-position policy active", 0);
+      if(IsOurPosition())
       {
-         LogDecisionEvent("PRECHECK", "Slippage filter blocked entry: projected=" + DoubleToString(projSlip,1), 0);
+         LogDecisionEvent("PRECHECK", "One-position policy active; existing managed position present", 0);
          return;
       }
-      LogDecisionEvent("PRECHECK", "Slippage filter PASS projected=" + DoubleToString(projSlip,1), 0);
    }
    else
    {
-      LogDecisionEvent("PRECHECK", "Slippage filter inactive", 0);
-   }
-   // Hard one-position policy
-   if(IsOurPosition())
-   {
-      LogDecisionEvent("PRECHECK", "One-position policy active; existing managed position present", 0);
-      return;
+      LogDecisionEvent("PRECHECK", "One-position policy inactive; multi-entry allowed", 0);
    }
    // Detect regime
    ENUM_REGIME regime = DetectRegime();
@@ -1085,7 +1080,7 @@ void OpenTrade(int side, ENUM_REGIME regime)
    }
    // Send order with retry
    bool success = false;
-   double spreadAtEntry = CurrentSpreadPoints();
+   double spreadAtEntry = EstimateSpreadPoints();
    for(int retry = 0; retry < InpMaxRetries; retry++)
    {
       if(side == 1)
@@ -1097,13 +1092,20 @@ void OpenTrade(int side, ENUM_REGIME regime)
          ulong resultTicket = FindManagedPositionTicket();
          if(resultTicket > 0)
          {
-            // Initialize managed state from live position
+            if(!PositionSelectByTicket(resultTicket))
+            {
+               LogDecisionEvent("ORDER_SUBMIT", "PositionSelectByTicket failed for ticket=" + IntegerToString((int)resultTicket) + ", using refresh fallback", 0);
+               if(!RefreshManagedStateFromPosition(resultTicket))
+               {
+                  LogDecisionEvent("ORDER_SUBMIT", "RefreshManagedStateFromPosition fallback failed for ticket=" + IntegerToString((int)resultTicket), 0);
+                  return;
+               }
+            }
             g_ms.active = true;
             g_ms.ticket = resultTicket;
             g_ms.positionId = (ulong)PositionGetInteger(POSITION_IDENTIFIER);
-            g_ms.direction = side;
-            PositionSelectByTicket(resultTicket);
             g_ms.entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            g_ms.direction = side;
             g_ms.initialSL = sl;
             g_ms.initialTP = tp;
             g_ms.initialVolume = lots;
@@ -1475,36 +1477,31 @@ void ApplyTrailingLogic(const MDAEFeatures &feat)
    // Swing Trail
    if(method == CM_SWING && EnableSwingTrail)
    {
+      int trailLookback = MathMax(2, InpTrailingStructureLookback);
       double swingLevel = 0;
       if(g_ms.direction == 1)
       {
          swingLevel = iLow(InpSymbolName, InpExecTF, 1);
-         for(int i = 2; i <= InpSwingLookback; i++)
+         for(int i = 2; i <= trailLookback; i++)
          {
             double lo = iLow(InpSymbolName, InpExecTF, i);
             if(lo < swingLevel) swingLevel = lo;
          }
-         // Use the highest recent swing low
-         double recentSwingLow = iLow(InpSymbolName, InpExecTF, 1);
-         for(int i = 2; i <= MathMin(InpSwingLookback, 5); i++)
-         {
-            double lo = iLow(InpSymbolName, InpExecTF, i);
-            if(lo > recentSwingLow) // highest swing low = most protective
-               recentSwingLow = lo;
-            // but ensure it's actually a swing (lower bars on both sides)
-         }
-         MoveSL(recentSwingLow - atr * 0.2, "SWING_TRAIL");
+         double targetSL = swingLevel - atr * 0.2;
+         LogDecisionEvent("MANAGEMENT", "SWING_TRAIL pivotLow=" + DoubleToString(swingLevel,_Digits) + " targetSL=" + DoubleToString(targetSL,_Digits), g_ms.currentR);
+         MoveSL(targetSL, "SWING_TRAIL");
       }
       else
       {
-         double recentSwingHigh = iHigh(InpSymbolName, InpExecTF, 1);
-         for(int i = 2; i <= MathMin(InpSwingLookback, 5); i++)
+         swingLevel = iHigh(InpSymbolName, InpExecTF, 1);
+         for(int i = 2; i <= trailLookback; i++)
          {
             double hi = iHigh(InpSymbolName, InpExecTF, i);
-            if(hi < recentSwingHigh)
-               recentSwingHigh = hi;
+            if(hi > swingLevel) swingLevel = hi;
          }
-         MoveSL(recentSwingHigh + atr * 0.2, "SWING_TRAIL");
+         double targetSL = swingLevel + atr * 0.2;
+         LogDecisionEvent("MANAGEMENT", "SWING_TRAIL pivotHigh=" + DoubleToString(swingLevel,_Digits) + " targetSL=" + DoubleToString(targetSL,_Digits), g_ms.currentR);
+         MoveSL(targetSL, "SWING_TRAIL");
       }
    }
    // Fast Bank
@@ -1521,32 +1518,34 @@ void ApplyTrailingLogic(const MDAEFeatures &feat)
    // Hybrid: blend ATR and structure
    if(method == CM_HYBRID && EnableHybridCloseMode)
    {
+      int trailLookback = MathMax(2, InpTrailingStructureLookback);
       double atrSL, structSL;
       if(g_ms.direction == 1)
       {
          atrSL = currentPrice - atr * InpATRTrailMultiplier;
          double recentLow = iLow(InpSymbolName, InpExecTF, 1);
-         for(int i = 2; i <= MathMin(InpSwingLookback, 5); i++)
+         for(int i = 2; i <= trailLookback; i++)
          {
             double lo = iLow(InpSymbolName, InpExecTF, i);
-            if(lo > recentLow) recentLow = lo;
+            if(lo < recentLow) recentLow = lo;
          }
          structSL = recentLow - atr * 0.2;
-         // Pick most protective (higher for longs)
          double bestSL = MathMax(atrSL, structSL);
+         LogDecisionEvent("MANAGEMENT", "HYBRID_TRAIL pivotLow=" + DoubleToString(recentLow,_Digits) + " atrSL=" + DoubleToString(atrSL,_Digits) + " finalSL=" + DoubleToString(bestSL,_Digits), g_ms.currentR);
          MoveSL(bestSL, "HYBRID_TRAIL");
       }
       else
       {
          atrSL = currentPrice + atr * InpATRTrailMultiplier;
          double recentHigh = iHigh(InpSymbolName, InpExecTF, 1);
-         for(int i = 2; i <= MathMin(InpSwingLookback, 5); i++)
+         for(int i = 2; i <= trailLookback; i++)
          {
             double hi = iHigh(InpSymbolName, InpExecTF, i);
-            if(hi < recentHigh) recentHigh = hi;
+            if(hi > recentHigh) recentHigh = hi;
          }
          structSL = recentHigh + atr * 0.2;
          double bestSL = MathMin(atrSL, structSL);
+         LogDecisionEvent("MANAGEMENT", "HYBRID_TRAIL pivotHigh=" + DoubleToString(recentHigh,_Digits) + " atrSL=" + DoubleToString(atrSL,_Digits) + " finalSL=" + DoubleToString(bestSL,_Digits), g_ms.currentR);
          MoveSL(bestSL, "HYBRID_TRAIL");
       }
    }
@@ -1694,7 +1693,7 @@ void LogDecisionEvent(string eventType, string detail, double score)
 {
    if(!EnableLogging) return;
    string ts = TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS);
-   double spread = CurrentSpreadPoints();
+   double spread = EstimateSpreadPoints();
    if(g_logHandle != INVALID_HANDLE)
    {
       FileWrite(g_logHandle, ts, InpSymbolName,
@@ -1737,7 +1736,7 @@ void LogTradeSummary(string closeType, double profit)
          DoubleToString(g_ms.currentR, 3),
          EnumToString(g_ms.activeMethod),
          detail, closeType,
-         DoubleToString(CurrentSpreadPoints(), 1), "",
+         DoubleToString(EstimateSpreadPoints(), 1), "",
          "0",
          (g_ms.stopChangedDueSpread ? "true" : "false"),
          (g_ms.stopChangedDueSlippage ? "true" : "false"));
