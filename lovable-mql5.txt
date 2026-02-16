@@ -204,6 +204,7 @@ struct ManagedState
 {
    bool     active;
    ulong    ticket;
+   ulong    positionId;
    int      direction;       // +1 buy, -1 sell
    double   entryPrice;
    double   initialSL;
@@ -270,7 +271,7 @@ int OnInit()
    // Setup trade object
    g_trade.SetExpertMagicNumber(InpMagicNumber);
    g_trade.SetDeviationInPoints(InpMaxSlippagePoints);
-   g_trade.SetTypeFilling(ORDER_FILLING_FOK);
+   SelectSupportedFillingMode();
    // Create indicator handles — M1
    g_hATR     = iATR(InpSymbolName, InpExecTF, InpATRPeriod);
    g_hADX     = iADX(InpSymbolName, InpExecTF, InpADXPeriod);
@@ -301,7 +302,7 @@ int OnInit()
    MqlDateTime dt;
    TimeCurrent(dt);
    g_dayStamp = dt.day_of_year;
-   g_weekStamp = dt.day_of_year / 7;
+   g_weekStamp = GetWeekStamp(dt);
    g_sessionDayStamp = g_dayStamp;
    // Reset managed state
    ResetManagedState();
@@ -372,41 +373,27 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
                         const MqlTradeResult &result)
 {
-   if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
+   if(trans.symbol != InpSymbolName) return;
+   ulong resolvedPositionId = (trans.position > 0) ? trans.position : trans.position_by;
+   if(trans.type == TRADE_TRANSACTION_DEAL_ADD && trans.deal > 0 && HistoryDealSelect(trans.deal))
    {
-      if(trans.symbol != InpSymbolName) return;
-      ulong dealTicket = trans.deal;
-      if(dealTicket == 0) return;
-      if(HistoryDealSelect(dealTicket))
+      long dealMagic = HistoryDealGetInteger(trans.deal, DEAL_MAGIC);
+      if(dealMagic != InpMagicNumber) return;
+      if(resolvedPositionId == 0) resolvedPositionId = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+      ENUM_DEAL_ENTRY de = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+      if(de == DEAL_ENTRY_OUT || de == DEAL_ENTRY_OUT_BY)
       {
-         long dealMagic = HistoryDealGetInteger(dealTicket, DEAL_MAGIC);
-         if(dealMagic != InpMagicNumber) return;
-         ENUM_DEAL_ENTRY dealEntry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
-         if(dealEntry == DEAL_ENTRY_OUT || dealEntry == DEAL_ENTRY_OUT_BY)
+         double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT) + HistoryDealGetDouble(trans.deal, DEAL_SWAP) + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
+         if(profit < 0) { g_dailyLossCount++; g_weeklyLossCount++; }
+         if(g_ms.active && resolvedPositionId > 0 && g_ms.positionId == resolvedPositionId && !PositionSelectByTicket(g_ms.ticket))
          {
-            double profit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT) +
-                            HistoryDealGetDouble(dealTicket, DEAL_SWAP) +
-                            HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
-            if(profit < 0)
-            {
-               g_dailyLossCount++;
-               g_weeklyLossCount++;
-            }
-            // Check if position fully closed
-            if(g_ms.active)
-            {
-               double remainingVol = 0;
-               if(PositionSelectByTicket(g_ms.ticket))
-                  remainingVol = PositionGetDouble(POSITION_VOLUME);
-               else
-                  remainingVol = 0;
-               if(remainingVol <= 0.0)
-               {
-                  LogTradeSummary("CLOSED", profit);
-                  ResetManagedState();
-               }
-            }
+            LogTradeSummary("CLOSED", profit);
+            ResetManagedState();
          }
+      }
+      else if((de == DEAL_ENTRY_IN || de == DEAL_ENTRY_INOUT) && resolvedPositionId > 0)
+      {
+         RefreshManagedStateFromPosition(resolvedPositionId);
       }
    }
 }
@@ -505,6 +492,96 @@ double CurrentSpreadPoints()
 {
    return (double)SymbolInfoInteger(InpSymbolName, SYMBOL_SPREAD);
 }
+
+int GetWeekStamp(const MqlDateTime &dt)
+{
+   int dow = dt.day_of_week;
+   if(dow == 0) dow = 7;
+   return dt.year * 1000 + (dt.day_of_year - dow + 10) / 7;
+}
+
+ulong FindManagedPositionTicket()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != InpSymbolName) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+      return ticket;
+   }
+   return 0;
+}
+
+bool RefreshManagedStateFromPosition(ulong ticket)
+{
+   if(ticket == 0 || !PositionSelectByTicket(ticket)) return false;
+   g_ms.active = true;
+   g_ms.ticket = ticket;
+   g_ms.positionId = (ulong)PositionGetInteger(POSITION_IDENTIFIER);
+   g_ms.entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+   g_ms.direction = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 1 : -1;
+   if(g_ms.initialVolume <= 0.0) g_ms.initialVolume = PositionGetDouble(POSITION_VOLUME);
+   return true;
+}
+
+double EstimateEntrySlippagePoints(double expectedPrice)
+{
+   MqlTick tick;
+   if(!SymbolInfoTick(InpSymbolName, tick)) return 0.0;
+   double ref = (expectedPrice > 0.0) ? expectedPrice : ((tick.ask + tick.bid) * 0.5);
+   return MathAbs(tick.ask - tick.bid) / SymbolInfoDouble(InpSymbolName, SYMBOL_POINT);
+}
+
+double ComputeVWAP(int bars)
+{
+   double pv = 0.0, vol = 0.0;
+   for(int i=0;i<bars;i++)
+   {
+      double h=iHigh(InpSymbolName, InpExecTF, i), l=iLow(InpSymbolName, InpExecTF, i), c=iClose(InpSymbolName, InpExecTF, i);
+      double tp=(h+l+c)/3.0;
+      double v=(double)iVolume(InpSymbolName, InpExecTF, i);
+      pv += tp*v; vol += v;
+   }
+   if(vol<=0.0) return iClose(InpSymbolName, InpExecTF, 0);
+   return pv/vol;
+}
+
+bool PassVWAPBias(int side, string stage)
+{
+   if(!EnableVWAPCheck)
+   {
+      LogDecisionEvent(stage, "VWAP check inactive", 0);
+      return true;
+   }
+   double vwap = ComputeVWAP(30);
+   double px = iClose(InpSymbolName, InpExecTF, 0);
+   bool pass = (side > 0) ? (px >= vwap) : (px <= vwap);
+   LogDecisionEvent(stage, "VWAP " + (pass ? "PASS" : "FAIL") + " px=" + DoubleToString(px,_Digits) + " vwap=" + DoubleToString(vwap,_Digits), 0);
+   return pass;
+}
+
+string RetcodeToString(int rc)
+{
+   if(rc == TRADE_RETCODE_DONE) return "DONE";
+   if(rc == TRADE_RETCODE_DONE_PARTIAL) return "DONE_PARTIAL";
+   if(rc == TRADE_RETCODE_REQUOTE) return "REQUOTE";
+   if(rc == TRADE_RETCODE_INVALID_FILL) return "INVALID_FILL";
+   if(rc == TRADE_RETCODE_REJECT) return "REJECT";
+   return "RET_" + IntegerToString(rc);
+}
+
+void SelectSupportedFillingMode()
+{
+   long fillMask = SymbolInfoInteger(InpSymbolName, SYMBOL_FILLING_MODE);
+   ENUM_ORDER_TYPE_FILLING selected = ORDER_FILLING_RETURN;
+   if((fillMask & ORDER_FILLING_FOK) == ORDER_FILLING_FOK) selected = ORDER_FILLING_FOK;
+   else if((fillMask & ORDER_FILLING_IOC) == ORDER_FILLING_IOC) selected = ORDER_FILLING_IOC;
+   else selected = ORDER_FILLING_RETURN;
+   g_trade.SetTypeFilling(selected);
+   Print("Selected filling mode=", (int)selected, " mask=", (int)fillMask);
+}
+
 //+------------------------------------------------------------------+
 //| HELPER — Day/Week Reset                                          |
 //+------------------------------------------------------------------+
@@ -513,12 +590,15 @@ void CheckDayWeekReset()
    MqlDateTime dt;
    TimeCurrent(dt);
    int curDay = dt.day_of_year;
-   int curWeek = curDay / 7;
+   int curWeek = GetWeekStamp(dt);
+   int oldDay = g_dayStamp;
+   int oldWeek = g_weekStamp;
    if(curDay != g_dayStamp)
    {
       g_dayStamp = curDay;
       g_startEquity = AccountInfoDouble(ACCOUNT_EQUITY);
       g_dailyLossCount = 0;
+      LogDecisionEvent("RESET", "DAY reset " + IntegerToString(oldDay) + " -> " + IntegerToString(curDay), 0);
    }
    if(curDay != g_sessionDayStamp)
    {
@@ -530,6 +610,7 @@ void CheckDayWeekReset()
       g_weekStamp = curWeek;
       g_weekStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
       g_weeklyLossCount = 0;
+      LogDecisionEvent("RESET", "WEEK reset " + IntegerToString(oldWeek) + " -> " + IntegerToString(curWeek), 0);
    }
 }
 //+------------------------------------------------------------------+
@@ -551,6 +632,7 @@ void ReconstructOpenPosition()
    if(!PositionSelectByTicket(ticket)) return;
    g_ms.active        = true;
    g_ms.ticket        = ticket;
+   g_ms.positionId    = (ulong)PositionGetInteger(POSITION_IDENTIFIER);
    g_ms.entryPrice    = PositionGetDouble(POSITION_PRICE_OPEN);
    g_ms.initialSL     = PositionGetDouble(POSITION_SL);
    g_ms.initialTP     = PositionGetDouble(POSITION_TP);
@@ -795,6 +877,7 @@ int EvaluateTrendEntry(double &quality)
          if(mtfDir != 0 && mtfDir != 1) return 0; // MTF conflict
          quality = 0.5 + (rsi - 40) / 60.0 * 0.3 + g_regimeConfidence * 0.2;
          quality = MathMin(1.0, quality);
+         if(!PassVWAPBias(1, "ENTRY_EVAL")) return 0;
          LogDecisionEvent("ENTRY_EVAL", "TREND_BUY quality=" + DoubleToString(quality,2), quality);
          return 1;
       }
@@ -809,6 +892,7 @@ int EvaluateTrendEntry(double &quality)
          if(mtfDir != 0 && mtfDir != -1) return 0;
          quality = 0.5 + (60 - rsi) / 60.0 * 0.3 + g_regimeConfidence * 0.2;
          quality = MathMin(1.0, quality);
+         if(!PassVWAPBias(-1, "ENTRY_EVAL")) return 0;
          LogDecisionEvent("ENTRY_EVAL", "TREND_SELL quality=" + DoubleToString(quality,2), quality);
          return -1;
       }
@@ -852,6 +936,7 @@ int EvaluateMeanReversionEntry(double &quality)
       if(mtfDir != 0 && mtfDir != 1) return 0;
       quality = 0.5 + (InpRSIOversold + 10 - rsi) / 40.0 * 0.3 + clv * 0.2;
       quality = MathMin(1.0, quality);
+      if(!PassVWAPBias(1, "ENTRY_EVAL")) return 0;
       LogDecisionEvent("ENTRY_EVAL", "MR_BUY quality=" + DoubleToString(quality,2), quality);
       return 1;
    }
@@ -863,6 +948,7 @@ int EvaluateMeanReversionEntry(double &quality)
       if(mtfDir != 0 && mtfDir != -1) return 0;
       quality = 0.5 + (rsi - (InpRSIOverbought - 10)) / 40.0 * 0.3 + clv * 0.2;
       quality = MathMin(1.0, quality);
+      if(!PassVWAPBias(-1, "ENTRY_EVAL")) return 0;
       LogDecisionEvent("ENTRY_EVAL", "MR_SELL quality=" + DoubleToString(quality,2), quality);
       return -1;
    }
@@ -899,9 +985,25 @@ void EvaluateEntry()
          return;
       }
    }
-   // One position only
-   if(EnableOnePositionOnly && IsOurPosition())
+   // Slippage entry filter
+   if(EnableSlippageEntryFilter)
    {
+      double projSlip = EstimateEntrySlippagePoints(0.0);
+      if(projSlip > InpMaxSlippagePoints)
+      {
+         LogDecisionEvent("PRECHECK", "Slippage filter blocked entry: projected=" + DoubleToString(projSlip,1), 0);
+         return;
+      }
+      LogDecisionEvent("PRECHECK", "Slippage filter PASS projected=" + DoubleToString(projSlip,1), 0);
+   }
+   else
+   {
+      LogDecisionEvent("PRECHECK", "Slippage filter inactive", 0);
+   }
+   // Hard one-position policy
+   if(IsOurPosition())
+   {
+      LogDecisionEvent("PRECHECK", "One-position policy active; existing managed position present", 0);
       return;
    }
    // Detect regime
@@ -992,14 +1094,16 @@ void OpenTrade(int side, ENUM_REGIME regime)
          success = g_trade.Sell(lots, InpSymbolName, 0, sl, tp, "MDAE_" + EnumToString(regime));
       if(success)
       {
-         ulong resultTicket = g_trade.ResultOrder();
+         ulong resultTicket = FindManagedPositionTicket();
          if(resultTicket > 0)
          {
-            // Initialize managed state
+            // Initialize managed state from live position
             g_ms.active = true;
             g_ms.ticket = resultTicket;
+            g_ms.positionId = (ulong)PositionGetInteger(POSITION_IDENTIFIER);
             g_ms.direction = side;
-            g_ms.entryPrice = (side == 1) ? ask : bid;
+            PositionSelectByTicket(resultTicket);
+            g_ms.entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
             g_ms.initialSL = sl;
             g_ms.initialTP = tp;
             g_ms.initialVolume = lots;
@@ -1033,7 +1137,13 @@ void OpenTrade(int side, ENUM_REGIME regime)
       {
          int err = (int)g_trade.ResultRetcode();
          if(EnableDebugPrints) Print("DEBUG: Order send retry ", retry, " err=", err);
-         if(err == 10004 || err == 10006 || err == 10013) // requote / reject / invalid price
+         if(err == TRADE_RETCODE_INVALID_FILL)
+         {
+            LogDecisionEvent("ORDER_SUBMIT", "Invalid fill mode; re-selecting supported mode", 0);
+            SelectSupportedFillingMode();
+            Sleep(100);
+         }
+         else if(err == 10004 || err == 10006 || err == 10013) // requote / reject / invalid price
             Sleep(200);
          else
             break;
@@ -1280,35 +1390,24 @@ bool MoveSL(double newSL, string reason)
 //+------------------------------------------------------------------+
 bool PartialClosePercent(double pctOfOriginal, string reason)
 {
-   if(!EnablePartialClose) return false;
-   if(!g_ms.active) return false;
+   if(!EnablePartialClose || !g_ms.active) return false;
    if(!PositionSelectByTicket(g_ms.ticket)) return false;
    double currentVol = PositionGetDouble(POSITION_VOLUME);
-   double closeVol = g_ms.initialVolume * pctOfOriginal / 100.0;
-   closeVol = NormalizeLot(closeVol);
-   double minLot = SymbolInfoDouble(InpSymbolName, SYMBOL_VOLUME_MIN);
-   if(closeVol < minLot)
+   double closeVol = NormalizeLot(g_ms.initialVolume * pctOfOriginal / 100.0);
+   if(closeVol > currentVol) closeVol = currentVol;
+   bool result = g_trade.PositionClosePartial(g_ms.ticket, closeVol);
+   if(!result)
    {
-      LogDecisionEvent("MANAGEMENT", "Partial skip: volume " + DoubleToString(closeVol,2) + " < minLot", g_ms.currentR);
+      LogDecisionEvent("MANAGEMENT", "Partial close failed ret=" + IntegerToString((int)g_trade.ResultRetcode()) + " " + RetcodeToString((int)g_trade.ResultRetcode()), g_ms.currentR);
       return false;
    }
-   if(closeVol > currentVol) closeVol = currentVol;
-   // Ensure remainder is valid
-   double remainder = NormalizeLot(currentVol - closeVol);
-   if(remainder > 0 && remainder < minLot)
+   if(PositionSelectByTicket(g_ms.ticket))
    {
-      closeVol = currentVol; // close all if remainder would be invalid
+      double afterVol = PositionGetDouble(POSITION_VOLUME);
+      if(afterVol > 0.0 && afterVol < g_ms.initialVolume) g_ms.initialVolume = MathMax(afterVol, SymbolInfoDouble(InpSymbolName, SYMBOL_VOLUME_MIN));
    }
-   bool result = false;
-   if(g_ms.direction == 1)
-      result = g_trade.Sell(closeVol, InpSymbolName, 0, 0, 0, "MDAE_Partial");
-   else
-      result = g_trade.Buy(closeVol, InpSymbolName, 0, 0, 0, "MDAE_Partial");
-   if(result)
-   {
-      LogDecisionEvent("MANAGEMENT", "Partial close " + DoubleToString(pctOfOriginal,0) + "% vol=" + DoubleToString(closeVol,2) + " reason=" + reason, g_ms.currentR);
-   }
-   return result;
+   LogDecisionEvent("MANAGEMENT", "Partial close " + DoubleToString(closeVol,2) + " reason=" + reason, g_ms.currentR);
+   return true;
 }
 //+------------------------------------------------------------------+
 //| POSITION MANAGEMENT — ApplyBreakEven                             |
@@ -1497,20 +1596,22 @@ bool CheckTimeStopExit()
 void ClosePosition(string reason)
 {
    if(!g_ms.active) return;
-   if(!PositionSelectByTicket(g_ms.ticket)) return;
-   double vol = PositionGetDouble(POSITION_VOLUME);
-   bool result = false;
-   if(g_ms.direction == 1)
-      result = g_trade.Sell(vol, InpSymbolName, 0, 0, 0, "MDAE_Close_" + reason);
-   else
-      result = g_trade.Buy(vol, InpSymbolName, 0, 0, 0, "MDAE_Close_" + reason);
+   bool result = g_trade.PositionClose(g_ms.ticket);
    if(result)
    {
+      if(PositionSelectByTicket(g_ms.ticket))
+      {
+         g_ms.initialVolume = PositionGetDouble(POSITION_VOLUME);
+      }
+      else
+      {
+         g_ms.active = false;
+      }
       LogDecisionEvent("EXIT", "Full close reason=" + reason, g_ms.currentR);
    }
    else
    {
-      if(EnableDebugPrints) Print("DEBUG: Close failed, retcode=", g_trade.ResultRetcode());
+      LogDecisionEvent("EXIT", "Full close failed ret=" + IntegerToString((int)g_trade.ResultRetcode()) + " " + RetcodeToString((int)g_trade.ResultRetcode()), g_ms.currentR);
    }
 }
 //+------------------------------------------------------------------+
@@ -1521,9 +1622,13 @@ void ManagePosition()
    if(!g_ms.active) return;
    if(!PositionSelectByTicket(g_ms.ticket))
    {
-      // Position no longer exists
-      ResetManagedState();
-      return;
+      ulong relinked = FindManagedPositionTicket();
+      if(relinked == 0 || !RefreshManagedStateFromPosition(relinked))
+      {
+         ResetManagedState();
+         return;
+      }
+      LogDecisionEvent("RECONCILE", "Relinked managed ticket to active position " + IntegerToString((int)relinked), 0);
    }
    // Update live metrics
    double currentPrice;
